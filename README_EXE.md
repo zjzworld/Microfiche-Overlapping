@@ -18,7 +18,7 @@
 
 ## Build on Windows
 
-Run in the project folder:
+Run in the project folder (or GitHub Workflows):
 
 ```bat
 build_exe.bat
