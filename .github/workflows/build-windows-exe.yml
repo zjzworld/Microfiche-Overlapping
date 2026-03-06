@@ -28,7 +28,7 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name MicroficheOverlapExtractor --collect-all paddleocr --collect-all paddlex --collect-all paddle microfiche_overlap_extractor.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name MicroficheOverlapExtractor microfiche_overlap_extractor.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
