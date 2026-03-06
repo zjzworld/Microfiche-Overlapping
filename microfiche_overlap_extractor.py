@@ -14,21 +14,30 @@ import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import fitz  # PyMuPDF
 import requests
 import tkinter as tk
 from PIL import Image
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 APP_NAME = "Microfiche Overlap Extractor"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.3.0"
 
 DEFAULT_CLASSIFY_PROMPT = (
     "Task: classify each microfiche page as overlap, blurry, clean, or uncertain.\n"
     "Definition of overlap: two different record cards are merged/superimposed in one scan, "
     "including clear side-by-side merge OR ghost/partial superimposition.\n"
+    "Typical clean transcript card content is often around 1000:447 in horizontal-to-vertical proportion "
+    "(about 2.24:1). If the visible card area looks materially longer/wider than a normal transcript card, "
+    "treat that as a strong overlap cue.\n"
+    "When a page looks horizontally stretched or longer than normal, do an OCR-style verification mentally: "
+    "read for duplicated/conflicting names, grades, headings, or two superimposed text layers before returning clean.\n"
+    "A second strong overlap cue is page-boundary overflow: identify the main page/card boundary, especially the right edge. "
+    "If the right boundary of the first/main page is visible but there is still text, numbers, headings, or another page/frame "
+    "to the right of that boundary, that is strong evidence of overlap.\n"
     "Definition of blurry: text is so unreadable that student name and grades cannot be recognized at all. "
     "If any student name or any grades can be seen even partially, it is NOT blurry.\n"
     "You must choose exactly one decision class.\n"
@@ -45,13 +54,33 @@ DEFAULT_CLASSIFY_PROMPT = (
 # Display name -> candidate real model IDs.
 # The GUI only shows display names. Request routing uses this internal mapping.
 MODEL_NAME_TO_IDS: Dict[str, List[str]] = {
+    "GPT-5.4": ["gpt-5.4", "GPT-5.4"],
     "GPT-5.3": ["gpt-5.3", "GPT-5.3"],
-    "GPT-5.2": ["gpt-5.2", "GPT-5.2"],
-    "GPT-5.3-Codex": ["gpt-5.3-codex", "gpt-5-codex", "gpt-5.1-codex", "gpt-5-codex-mini"],
     "Claude-Opus-4.6": ["claude-opus-4-6", "claude-opus-4-5-20251101"],
     "Kimi-K2.5": ["kimi-k2.5"],
     "GLM-5": ["glm-5"],
     "MiniMax-M2.5": ["MiniMax-M2.5", "minimax-m2.5"],
+}
+
+UI_TOKENS: Dict[str, str] = {
+    "canvas": "#F6F1EF",
+    "canvas_soft": "#ECE8E6",
+    "card": "#FBFAF8",
+    "card_soft": "#F4F0EE",
+    "card_strong": "#FFFFFF",
+    "line": "#DAD4D0",
+    "line_soft": "#E7E1DC",
+    "ink": "#1D232B",
+    "ink_soft": "#5C6671",
+    "muted": "#7D8792",
+    "accent": "#6D88A6",
+    "accent_soft": "#E4ECF4",
+    "rose_soft": "#F1DDE6",
+    "ice_soft": "#DCEAF2",
+    "sand_soft": "#EEE7DE",
+    "run": "#617E99",
+    "danger": "#B27570",
+    "success": "#6C836D",
 }
 
 
@@ -84,12 +113,10 @@ def normalize_display_model_name(name: str, model: str) -> str:
                 return display
     # Legacy profile names created by earlier app versions.
     legacy = n.lower()
-    if legacy.startswith("gpt-5.3"):
+    if legacy.startswith("gpt-5.4"):
+        return "GPT-5.4"
+    if legacy.startswith("gpt-5.3") and "codex" not in legacy:
         return "GPT-5.3"
-    if legacy.startswith("gpt-5.2"):
-        return "GPT-5.2"
-    if "codex" in legacy and "5.3" in legacy:
-        return "GPT-5.3-Codex"
     if "claude-opus-4.6" in legacy or "claude-opus-4-6" in legacy:
         return "Claude-Opus-4.6"
     if "kimi-k2.5" in legacy:
@@ -147,7 +174,15 @@ class Storage:
             for x in raw:
                 raw_name = str(x.get("name", ""))
                 raw_model = str(x.get("model", ""))
+                raw_name_l = raw_name.strip().lower()
+                raw_model_l = raw_model.strip().lower()
+                if "codex" in raw_name_l or "codex" in raw_model_l:
+                    changed = True
+                    continue
                 display_model = normalize_display_model_name(raw_name, raw_model)
+                if display_model in {"GPT-5.2"}:
+                    changed = True
+                    continue
                 if display_model and (raw_name != display_model or raw_model != display_model):
                     changed = True
                 out.append(
@@ -159,6 +194,13 @@ class Storage:
                         timeout_sec=int(x.get("timeout_sec", 120)),
                     )
                 )
+            defaults_by_name = {m.name: m for m in self.default_models()}
+            if not any(m.name == "GPT-5.4" for m in out):
+                out.insert(0, defaults_by_name["GPT-5.4"])
+                changed = True
+            if not any(m.name == "GPT-5.3" for m in out):
+                out.insert(1 if out else 0, defaults_by_name["GPT-5.3"])
+                changed = True
             if changed and out:
                 self.save_models(out)
             return out or self.default_models()
@@ -173,16 +215,17 @@ class Storage:
 
     def load_memory(self) -> Dict[str, Any]:
         if not self.memory_path.exists():
-            data = {"global_notes": [], "overrides": {}}
+            data = {"global_notes": [], "overrides": {}, "correction_history": []}
             self.save_memory(data)
             return data
         try:
             data = json.loads(self.memory_path.read_text(encoding="utf-8"))
             data.setdefault("global_notes", [])
             data.setdefault("overrides", {})
+            data.setdefault("correction_history", [])
             return data
         except Exception:
-            data = {"global_notes": [], "overrides": {}}
+            data = {"global_notes": [], "overrides": {}, "correction_history": []}
             self.save_memory(data)
             return data
 
@@ -208,24 +251,17 @@ class Storage:
     def default_models() -> List[ModelProfile]:
         return [
             ModelProfile(
+                name="GPT-5.4",
+                base_url="https://ai.last.ee",
+                model="GPT-5.4",
+                api_key="sk-9b06f0ac4851ba8cdef2498ba269978ae5c64e099720b2a1b32d0d1b5f6631b4",
+                timeout_sec=120,
+            ),
+            ModelProfile(
                 name="GPT-5.3",
-                base_url="https://gmn.chuangzuoli.com/v1",
+                base_url="https://ai.last.ee",
                 model="GPT-5.3",
-                api_key="sk-c459a469d12f8896aeaa45ea94e0e5f7b3eafbe6fcc98dfff86fad74e724bd5d",
-                timeout_sec=120,
-            ),
-            ModelProfile(
-                name="GPT-5.2",
-                base_url="https://gmn.chuangzuoli.com/v1",
-                model="GPT-5.2",
-                api_key="sk-c459a469d12f8896aeaa45ea94e0e5f7b3eafbe6fcc98dfff86fad74e724bd5d",
-                timeout_sec=120,
-            ),
-            ModelProfile(
-                name="GPT-5.3-Codex",
-                base_url="https://gmn.chuangzuoli.com/v1",
-                model="GPT-5.3-Codex",
-                api_key="sk-c459a469d12f8896aeaa45ea94e0e5f7b3eafbe6fcc98dfff86fad74e724bd5d",
+                api_key="sk-9b06f0ac4851ba8cdef2498ba269978ae5c64e099720b2a1b32d0d1b5f6631b4",
                 timeout_sec=120,
             ),
             ModelProfile(
@@ -311,6 +347,289 @@ def render_page_jpeg(page: fitz.Page, dpi: int = 220, max_width: int = 960, qual
     return bio.getvalue()
 
 
+def is_localish_base_url(base_url: str) -> bool:
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    return host in {"127.0.0.1", "localhost", "0.0.0.0", "::1"} or host.endswith(".local")
+
+
+def measure_page_visual_cues(image_jpeg: bytes) -> Dict[str, Any]:
+    try:
+        img = Image.open(io.BytesIO(image_jpeg)).convert("L")
+        w, h = img.size
+        mask = img.point(lambda px: 255 if px < 242 else 0, mode="L")
+        bbox = mask.getbbox()
+        cues: Dict[str, Any] = {
+            "image_width": w,
+            "image_height": h,
+            "image_ratio": round(w / max(h, 1), 3),
+        }
+        if bbox:
+            bw = max(1, bbox[2] - bbox[0])
+            bh = max(1, bbox[3] - bbox[1])
+            crop = mask.crop(bbox)
+            crop_w, crop_h = crop.size
+            cols = [0] * crop_w
+            pixels = crop.load()
+            for x in range(crop_w):
+                dark = 0
+                for y in range(crop_h):
+                    if pixels[x, y]:
+                        dark += 1
+                cols[x] = dark
+            search_start = max(0, int(crop_w * 0.50))
+            search_end = max(search_start + 1, int(crop_w * 0.92))
+            boundary_local_x = max(range(search_start, search_end), key=lambda i: cols[i])
+            boundary_strength = cols[boundary_local_x] / max(crop_h, 1)
+            outside_dark = 0
+            outside_area = max(1, (crop_w - boundary_local_x - 1) * crop_h)
+            outside_col_max = 0
+            if boundary_local_x + 1 < crop_w:
+                for x in range(boundary_local_x + 1, crop_w):
+                    outside_col_max = max(outside_col_max, cols[x])
+                    outside_dark += cols[x]
+            cues.update(
+                {
+                    "content_width": bw,
+                    "content_height": bh,
+                    "content_ratio": round(bw / bh, 3),
+                    "content_bbox": [int(x) for x in bbox],
+                    "right_boundary_x": int(bbox[0] + boundary_local_x),
+                    "right_boundary_strength": round(boundary_strength, 3),
+                    "right_of_boundary_dark_ratio": round(outside_dark / outside_area, 4),
+                    "right_of_boundary_colmax_ratio": round(outside_col_max / max(crop_h, 1), 4),
+                }
+            )
+        return cues
+    except Exception:
+        return {}
+
+
+def ocr_summary_text(ocr_info: Optional[Dict[str, Any]]) -> str:
+    if not ocr_info:
+        return ""
+    if not ocr_info.get("ok", False):
+        return str(ocr_info.get("error", "ocr_unavailable"))[:240]
+    bits = [
+        f"text_boxes={int(ocr_info.get('text_box_count', 0))}",
+        f"outside_right_boxes={int(ocr_info.get('outside_right_box_count', 0))}",
+        f"outside_right_chars={int(ocr_info.get('outside_right_char_count', 0))}",
+        f"mean_score={float(ocr_info.get('mean_score', 0.0)):.2f}",
+    ]
+    if ocr_info.get("strong_overlap_evidence"):
+        bits.append("strong_overlap_evidence=yes")
+    if ocr_info.get("likely_blurry"):
+        bits.append("likely_blurry=yes")
+    preview = str(ocr_info.get("preview_text", "")).strip()
+    if preview:
+        bits.append(f"preview={preview[:80]}")
+    return "; ".join(bits)
+
+
+class PaddleOCRAssistant:
+    def __init__(self, logger) -> None:
+        self.log = logger
+        self._ocr = None
+        self._np = None
+        self._init_attempted = False
+        self._init_error = ""
+
+    def _ensure_loaded(self) -> None:
+        if self._ocr is not None or self._init_attempted:
+            return
+        self._init_attempted = True
+        try:
+            os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+            import numpy as np  # type: ignore
+            from paddleocr import PaddleOCR  # type: ignore
+
+            self._np = np
+            self._ocr = PaddleOCR(
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                lang="en",
+            )
+            self.log("Local PaddleOCR assistant initialized.")
+        except Exception as exc:
+            self._init_error = f"{type(exc).__name__}: {exc}"
+            self.log(f"Local PaddleOCR assistant unavailable: {self._init_error}")
+
+    def ready(self) -> Tuple[bool, str]:
+        self._ensure_loaded()
+        if self._ocr is None:
+            return False, self._init_error or "PaddleOCR unavailable."
+        return True, "PaddleOCR ready."
+
+    @staticmethod
+    def _alnum_count(text: str) -> int:
+        return sum(1 for ch in text if ch.isalnum())
+
+    @staticmethod
+    def _box_bounds(poly: Any) -> Optional[Tuple[float, float, float, float]]:
+        try:
+            xs = [float(pt[0]) for pt in poly]
+            ys = [float(pt[1]) for pt in poly]
+            return min(xs), min(ys), max(xs), max(ys)
+        except Exception:
+            return None
+
+    def analyze_page(self, image_jpeg: bytes, page_cues: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self._ensure_loaded()
+        if self._ocr is None or self._np is None:
+            return {
+                "ok": False,
+                "error": self._init_error or "PaddleOCR unavailable",
+                "strong_overlap_evidence": False,
+                "likely_blurry": False,
+            }
+
+        try:
+            img = Image.open(io.BytesIO(image_jpeg)).convert("RGB")
+            arr = self._np.array(img)
+            raw = self._ocr.predict(arr)
+            item = raw[0] if raw else {}
+            texts = [str(x).strip() for x in item.get("rec_texts", [])]
+            scores = [float(x) for x in item.get("rec_scores", [])]
+            polys = list(item.get("dt_polys", []) or [])
+            width, height = img.size
+
+            boundary_x = None
+            if page_cues:
+                bx = page_cues.get("right_boundary_x")
+                if bx is not None:
+                    boundary_x = int(bx)
+                elif page_cues.get("content_bbox"):
+                    bbox = page_cues["content_bbox"]
+                    try:
+                        left = int(bbox[0])
+                        right = int(bbox[2])
+                        boundary_x = left + int((right - left) * 0.68)
+                    except Exception:
+                        boundary_x = None
+            if boundary_x is None:
+                boundary_x = int(width * 0.68)
+
+            margin = max(10, int(width * 0.012))
+            readable_count = 0
+            readable_chars = 0
+            score_sum = 0.0
+            outside_boxes = 0
+            outside_chars = 0
+            outside_score_sum = 0.0
+            outside_examples: List[str] = []
+
+            for idx, poly in enumerate(polys):
+                bounds = self._box_bounds(poly)
+                if not bounds:
+                    continue
+                xmin, _ymin, _xmax, _ymax = bounds
+                text = texts[idx] if idx < len(texts) else ""
+                score = scores[idx] if idx < len(scores) else 0.0
+                text = re.sub(r"\s+", " ", text).strip()
+                alnum = self._alnum_count(text)
+                if alnum >= 2:
+                    readable_count += 1
+                    readable_chars += alnum
+                    score_sum += max(0.0, score)
+                    if xmin > boundary_x + margin:
+                        outside_boxes += 1
+                        outside_chars += alnum
+                        outside_score_sum += max(0.0, score)
+                        if text and len(outside_examples) < 4:
+                            outside_examples.append(text[:24])
+
+            mean_score = score_sum / max(readable_count, 1)
+            outside_mean_score = outside_score_sum / max(outside_boxes, 1)
+            strong_overlap = (
+                outside_boxes >= 2
+                and outside_chars >= 5
+                and (
+                    float((page_cues or {}).get("right_of_boundary_dark_ratio", 0.0)) >= 0.006
+                    or float((page_cues or {}).get("right_of_boundary_colmax_ratio", 0.0)) >= 0.03
+                    or float((page_cues or {}).get("content_ratio", 0.0)) >= 2.30
+                )
+            )
+            likely_blurry = readable_chars < 4 and mean_score < 0.25
+
+            preview_parts = [t for t in texts if self._alnum_count(t) >= 2][:6]
+            return {
+                "ok": True,
+                "boundary_x": boundary_x,
+                "text_box_count": readable_count,
+                "text_char_count": readable_chars,
+                "mean_score": round(mean_score, 3),
+                "outside_right_box_count": outside_boxes,
+                "outside_right_char_count": outside_chars,
+                "outside_right_mean_score": round(outside_mean_score, 3),
+                "outside_right_examples": outside_examples,
+                "strong_overlap_evidence": strong_overlap,
+                "likely_blurry": likely_blurry,
+                "preview_text": " | ".join(preview_parts[:4])[:160],
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "strong_overlap_evidence": False,
+                "likely_blurry": False,
+            }
+
+
+def apply_ocr_assist_to_decision(rec: Dict[str, Any], ocr_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not ocr_info:
+        return rec
+    rec["ocr_summary"] = ocr_summary_text(ocr_info)
+    rec["ocr_overlap_flag"] = bool(ocr_info.get("strong_overlap_evidence", False))
+    rec["ocr_blurry_flag"] = bool(ocr_info.get("likely_blurry", False))
+
+    if not ocr_info.get("ok", False):
+        return rec
+
+    conf = float(rec.get("confidence", 0.0))
+    if (
+        rec.get("decision") in {"clean", "uncertain"}
+        and ocr_info.get("strong_overlap_evidence")
+        and conf < 0.92
+    ):
+        rec["decision"] = "overlap"
+        rec["is_overlap"] = True
+        rec["is_blurry"] = False
+        rec["confidence"] = max(conf, 0.84)
+        if rec.get("overlap_type") in {"", "none"}:
+            rec["overlap_type"] = "clear_double_card"
+        reason = str(rec.get("reason", "")).strip()
+        ocr_reason = "local PaddleOCR found readable text beyond the estimated right page boundary"
+        rec["reason"] = f"{reason} | {ocr_reason}" if reason else ocr_reason
+        rec["status"] = "ok_ocr_assisted"
+
+    if (
+        rec.get("decision") == "uncertain"
+        and ocr_info.get("likely_blurry")
+        and not ocr_info.get("strong_overlap_evidence")
+    ):
+        rec["decision"] = "blurry"
+        rec["is_overlap"] = False
+        rec["is_blurry"] = True
+        rec["confidence"] = max(conf, 0.62)
+        reason = str(rec.get("reason", "")).strip()
+        ocr_reason = "local PaddleOCR found essentially no readable transcript text"
+        rec["reason"] = f"{reason} | {ocr_reason}" if reason else ocr_reason
+        rec["status"] = "ok_ocr_assisted"
+
+    return rec
+
+
 OVERLAP_CSV_FIELDS = [
     "source_directory",
     "file_name",
@@ -325,6 +644,10 @@ OVERLAP_CSV_FIELDS = [
     "reason",
     "model",
     "resolved_model",
+    "endpoint",
+    "ocr_overlap_flag",
+    "ocr_blurry_flag",
+    "ocr_summary",
     "status",
     "error_detail",
 ]
@@ -364,8 +687,344 @@ def summarize_page_result(rec: Dict[str, Any]) -> str:
         f"decision={rec.get('decision')} overlap={rec.get('is_overlap')} "
         f"blurry={rec.get('is_blurry')} conf={float(rec.get('confidence', 0.0)):.2f} "
         f"model={rec.get('resolved_model') or rec.get('model')} "
+        f"endpoint={rec.get('endpoint', '')} "
+        f"ocr={str(rec.get('ocr_summary', ''))[:90]} "
         f"reason={str(rec.get('reason', ''))[:120]}"
     )
+
+
+def ensure_memory_schema(memory: Dict[str, Any]) -> Dict[str, Any]:
+    memory.setdefault("global_notes", [])
+    memory.setdefault("overrides", {})
+    memory.setdefault("correction_history", [])
+    return memory
+
+
+def flags_from_decision(decision: str) -> Tuple[bool, bool]:
+    d = (decision or "").strip().lower()
+    return d == "overlap", d == "blurry"
+
+
+def correction_summary(entry: Dict[str, Any]) -> str:
+    file_name = str(entry.get("file_name", "unknown.pdf"))
+    page = int(entry.get("page", 0))
+    previous = str(entry.get("previous_decision", "unknown"))
+    corrected = str(entry.get("corrected_decision", "unknown"))
+    note = str(entry.get("note", "")).strip()
+    bits = [f"{file_name} p{page}: corrected {previous} -> {corrected}"]
+    if note:
+        bits.append(f"note={note}")
+    sigs = [str(s).strip() for s in entry.get("signatures", []) if str(s).strip()]
+    if sigs:
+        bits.append("signatures=" + " | ".join(sigs[:2]))
+    return "; ".join(bits)
+
+
+def build_memory_notes(memory: Dict[str, Any], file_name: str) -> List[str]:
+    ensure_memory_schema(memory)
+    notes: List[str] = []
+    seen: set[str] = set()
+
+    def add(note: str) -> None:
+        note = note.strip()
+        if not note:
+            return
+        if note in seen:
+            return
+        seen.add(note)
+        notes.append(note)
+
+    for note in memory.get("global_notes", [])[:10]:
+        add(str(note))
+
+    target = (file_name or "").strip().lower()
+    history = [x for x in memory.get("correction_history", []) if isinstance(x, dict)]
+    same_file = [x for x in reversed(history) if str(x.get("file_name", "")).strip().lower() == target]
+    recent = list(reversed(history))
+
+    for entry in same_file[:8]:
+        add("Same-file correction memory: " + correction_summary(entry))
+    for entry in recent[:8]:
+        add("Recent correction memory: " + correction_summary(entry))
+
+    return notes[:18]
+
+
+def remember_page_correction(memory: Dict[str, Any], rec: Dict[str, Any], corrected_decision: str, note: str) -> Dict[str, Any]:
+    ensure_memory_schema(memory)
+    corrected_decision = corrected_decision.strip().lower()
+    if corrected_decision not in {"overlap", "blurry", "clean", "uncertain"}:
+        raise ValueError("Corrected decision must be one of overlap, blurry, clean, uncertain.")
+
+    file_name = str(rec.get("file_name", "")).strip()
+    page_no = int(rec.get("page", 0))
+    if not file_name or page_no <= 0:
+        raise ValueError("Correction target is missing file_name or page.")
+
+    is_overlap, is_blurry = flags_from_decision(corrected_decision)
+    key = f"{file_name.lower()}::{page_no}"
+    override = {
+        "decision": corrected_decision,
+        "is_overlap": is_overlap,
+        "is_blurry": is_blurry,
+        "confidence": 1.0,
+        "overlap_type": "manual_override",
+        "signatures": list(rec.get("signatures", []))[:2],
+        "note": note.strip() or f"manual correction from {rec.get('decision', 'unknown')} to {corrected_decision}",
+        "updated_at": now_ts(),
+    }
+    memory["overrides"][key] = override
+
+    history = memory.setdefault("correction_history", [])
+    history.append(
+        {
+            "file_name": file_name,
+            "file_path": str(rec.get("file_path", "")),
+            "page": page_no,
+            "previous_decision": str(rec.get("decision", "unknown")),
+            "corrected_decision": corrected_decision,
+            "note": note.strip(),
+            "signatures": list(rec.get("signatures", []))[:2],
+            "overlap_type": str(rec.get("overlap_type", "none")),
+            "updated_at": now_ts(),
+        }
+    )
+    if len(history) > 300:
+        del history[:-300]
+
+    global_notes = memory.setdefault("global_notes", [])
+    if note and note.strip() and note.strip() not in global_notes:
+        global_notes.append(note.strip())
+    auto_note = (
+        f"If a microfiche page looks unusually wide or stretched compared with a normal transcript card, "
+        f"do not mark it clean until OCR-style reading rules out overlap. Example memory: {file_name} p{page_no} -> {corrected_decision}."
+    )
+    if auto_note not in global_notes:
+        global_notes.append(auto_note)
+
+    return override
+
+
+def find_last_scan_record(records: List[Dict[str, Any]], file_ref: str, page_no: int) -> Optional[Dict[str, Any]]:
+    file_ref = file_ref.strip().lower()
+    candidates = []
+    for rec in records:
+        rec_file = str(rec.get("file_name", "")).strip().lower()
+        rec_path = str(rec.get("file_path", "")).strip().lower()
+        rec_page = int(rec.get("page", 0))
+        if rec_page != page_no:
+            continue
+        if file_ref in {rec_file, rec_path, Path(rec_path).stem.lower(), Path(rec_path).name.lower()}:
+            return rec
+        if file_ref and (file_ref in rec_file or file_ref in rec_path):
+            candidates.append(rec)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+class CorrectionPicker(tk.Toplevel):
+    def __init__(self, parent: "App", records: List[Dict[str, Any]]) -> None:
+        super().__init__(parent)
+        self.parent = parent
+        self.records = [r for r in records if r.get("scope") == "source"]
+        self.filtered_records = list(self.records)
+        self.title("Correct Last Scan Page")
+        self.geometry("1080x720")
+        self.minsize(940, 620)
+        self.configure(bg=parent.ui["canvas"])
+        self.transient(parent)
+        self.grab_set()
+
+        self.filter_var = tk.StringVar()
+        self.corrected_var = tk.StringVar(value="overlap")
+        self.status_var = tk.StringVar(value="Select a page, then save a correction into local memory.")
+
+        shell = tk.Frame(self, bg=parent.ui["canvas"])
+        shell.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(1, weight=1)
+
+        top = tk.Frame(shell, bg=parent.ui["card"])
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        tk.Label(top, text="Correct Last Scan Page", font=parent.font_heading, fg=parent.ui["ink"], bg=parent.ui["card"]).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 4))
+        tk.Label(
+            top,
+            text="Filter by file name, page, decision, or reason. Corrections are stored locally and reused in later scans.",
+            font=parent.font_caption,
+            fg=parent.ui["muted"],
+            bg=parent.ui["card"],
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 14))
+
+        filter_row = tk.Frame(shell, bg=parent.ui["canvas"])
+        filter_row.grid(row=1, column=0, sticky="nsew")
+        filter_row.columnconfigure(0, weight=3)
+        filter_row.columnconfigure(1, weight=2)
+        filter_row.rowconfigure(0, weight=1)
+
+        left = tk.Frame(filter_row, bg=parent.ui["card"], highlightbackground=parent.ui["line"], highlightthickness=1, bd=0)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+
+        search_row = tk.Frame(left, bg=parent.ui["card"])
+        search_row.grid(row=0, column=0, sticky="ew", padx=14, pady=14)
+        ttk.Entry(search_row, textvariable=self.filter_var, style="Glass.TEntry").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(search_row, text="Filter", style="Glass.TButton", command=self.refresh).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(search_row, text="Reset", style="Glass.TButton", command=self.reset_filter).pack(side=tk.LEFT, padx=(8, 0))
+        self.filter_var.trace_add("write", lambda *_args: self.refresh())
+
+        columns = ("file_name", "page", "decision", "confidence", "reason")
+        self.tree = ttk.Treeview(left, columns=columns, show="headings", height=18)
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.tree.heading("file_name", text="File")
+        self.tree.heading("page", text="Page")
+        self.tree.heading("decision", text="Current")
+        self.tree.heading("confidence", text="Conf")
+        self.tree.heading("reason", text="Reason")
+        self.tree.column("file_name", width=240, anchor="w")
+        self.tree.column("page", width=64, anchor="center")
+        self.tree.column("decision", width=92, anchor="center")
+        self.tree.column("confidence", width=60, anchor="center")
+        self.tree.column("reason", width=360, anchor="w")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.on_select())
+        self.tree.bind("<Double-1>", lambda _e: self.save())
+
+        right = tk.Frame(filter_row, bg=parent.ui["card"], highlightbackground=parent.ui["line"], highlightthickness=1, bd=0)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(4, weight=1)
+
+        tk.Label(right, text="Selected Page", font=parent.font_heading, fg=parent.ui["ink"], bg=parent.ui["card"]).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 8))
+        self.selection_label = tk.Label(
+            right,
+            text="No page selected",
+            font=parent.font_status,
+            fg=parent.ui["ink_soft"],
+            bg=parent.ui["card"],
+            justify="left",
+            wraplength=320,
+        )
+        self.selection_label.grid(row=1, column=0, sticky="w", padx=16)
+
+        label_row = tk.Frame(right, bg=parent.ui["card"])
+        label_row.grid(row=2, column=0, sticky="w", padx=16, pady=(14, 10))
+        tk.Label(label_row, text="Corrected Label", font=parent.font_label, fg=parent.ui["ink_soft"], bg=parent.ui["card"]).pack(anchor="w")
+        for val in ("overlap", "blurry", "clean", "uncertain"):
+            tk.Radiobutton(
+                label_row,
+                text=val,
+                value=val,
+                variable=self.corrected_var,
+                bg=parent.ui["card"],
+                activebackground=parent.ui["card"],
+                highlightthickness=0,
+                fg=parent.ui["ink"],
+                selectcolor=parent.ui["card_strong"],
+            ).pack(anchor="w")
+
+        tk.Label(right, text="Memory Note", font=parent.font_label, fg=parent.ui["ink_soft"], bg=parent.ui["card"]).grid(row=3, column=0, sticky="w", padx=16)
+        self.note_text = ScrolledText(right, height=10)
+        self.note_text.grid(row=4, column=0, sticky="nsew", padx=16, pady=(6, 10))
+        parent._style_text_widget(self.note_text)
+
+        bottom = tk.Frame(right, bg=parent.ui["card"])
+        bottom.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
+        ttk.Button(bottom, text="Save Correction", style="Accent.TButton", command=self.save).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Close", style="Glass.TButton", command=self.destroy).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(bottom, textvariable=self.status_var, font=parent.font_caption, fg=parent.ui["muted"], bg=parent.ui["card"]).pack(side=tk.RIGHT)
+
+        self.refresh()
+
+    def reset_filter(self) -> None:
+        self.filter_var.set("")
+        self.refresh()
+
+    def refresh(self) -> None:
+        query = self.filter_var.get().strip().lower()
+        if query:
+            self.filtered_records = []
+            for rec in self.records:
+                hay = " ".join(
+                    [
+                        str(rec.get("file_name", "")),
+                        str(rec.get("file_path", "")),
+                        str(rec.get("page", "")),
+                        str(rec.get("decision", "")),
+                        str(rec.get("reason", "")),
+                    ]
+                ).lower()
+                if query in hay:
+                    self.filtered_records.append(rec)
+        else:
+            self.filtered_records = list(self.records)
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for idx, rec in enumerate(self.filtered_records):
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    rec.get("file_name", ""),
+                    int(rec.get("page", 0)),
+                    rec.get("decision", ""),
+                    f"{float(rec.get('confidence', 0.0)):.2f}",
+                    str(rec.get("reason", ""))[:80],
+                ),
+            )
+        self.status_var.set(f"{len(self.filtered_records)} pages shown")
+
+    def selected_record(self) -> Optional[Dict[str, Any]]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        idx = int(sel[0])
+        if 0 <= idx < len(self.filtered_records):
+            return self.filtered_records[idx]
+        return None
+
+    def on_select(self) -> None:
+        rec = self.selected_record()
+        if not rec:
+            self.selection_label.configure(text="No page selected")
+            return
+        self.selection_label.configure(
+            text=(
+                f"{rec.get('file_name')} p{int(rec.get('page', 0)):03d}\n"
+                f"Current: {rec.get('decision')} | Conf: {float(rec.get('confidence', 0.0)):.2f}\n"
+                f"Endpoint: {rec.get('endpoint', '') or '-'}"
+            )
+        )
+        self.corrected_var.set(str(rec.get("decision", "clean")))
+        self.note_text.delete("1.0", tk.END)
+        self.note_text.insert("1.0", str(rec.get("reason", "")))
+
+    def save(self) -> None:
+        rec = self.selected_record()
+        if not rec:
+            messagebox.showerror("No Selection", "Select a page first.", parent=self)
+            return
+        corrected = self.corrected_var.get().strip().lower()
+        note = self.note_text.get("1.0", tk.END).strip()
+        try:
+            remember_page_correction(self.parent.memory, rec, corrected, note)
+            self.parent.storage.save_memory(self.parent.memory)
+            self.parent._refresh_memory_info()
+            self.parent.log(
+                f"Stored correction memory for {rec.get('file_name')} p{int(rec.get('page', 0)):03d}: "
+                f"{rec.get('decision')} -> {corrected}"
+            )
+            self.status_var.set("Correction saved to local memory")
+            messagebox.showinfo(
+                "Correction Saved",
+                f"Saved correction for {rec.get('file_name')} p{int(rec.get('page', 0))}: "
+                f"{rec.get('decision')} -> {corrected}",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Correction Error", str(exc), parent=self)
 
 
 class OpenAICompatibleClient:
@@ -373,13 +1032,23 @@ class OpenAICompatibleClient:
         self.profile = profile
         alias = profile.model.strip() or profile.name.strip()
         self.model_candidates = resolve_model_candidates(alias)
+        base = (profile.base_url or "").lower()
+        self.responses_only = "ai.last.ee" in base
 
-    def _post(self, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
-        url = self.profile.base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.profile.api_key}",
-            "Content-Type": "application/json",
-        }
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.profile.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.profile.api_key}"
+        return headers
+
+    def _post_json(self, endpoint: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
+        base = self.profile.base_url.rstrip("/")
+        parsed = urlparse(base)
+        if parsed.path.rstrip("/") == "":
+            url = base + "/v1" + endpoint
+        else:
+            url = base + endpoint
+        headers = self._headers()
         try:
             resp = requests.post(
                 url,
@@ -396,6 +1065,145 @@ class OpenAICompatibleClient:
         except Exception as exc:
             return -1, {}, f"request_error: {type(exc).__name__}: {exc}"
 
+    def _post_chat(self, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
+        return self._post_json("/chat/completions", payload)
+
+    def _post_responses(self, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
+        return self._post_json("/responses", payload)
+
+    @staticmethod
+    def _extract_chat_text(obj: Dict[str, Any]) -> str:
+        msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(msg, str):
+            return msg
+        if isinstance(msg, list):
+            parts = []
+            for item in msg:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            return "\n".join([p for p in parts if p])
+        return ""
+
+    @staticmethod
+    def _extract_responses_text(obj: Dict[str, Any]) -> str:
+        direct = obj.get("output_text")
+        if isinstance(direct, str) and direct.strip():
+            return direct
+        parts: List[str] = []
+        for item in obj.get("output", []):
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                text = content.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+        return "\n".join(parts).strip()
+
+    def _try_responses(self, model_id: str, prompt: str, b64: str, max_output_tokens: int) -> Tuple[bool, Dict[str, Any]]:
+        payload = {
+            "model": model_id,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
+                    ],
+                }
+            ],
+            "max_output_tokens": max_output_tokens,
+        }
+        status, obj, raw = self._post_responses(payload)
+        if status == 200 and obj:
+            msg = self._extract_responses_text(obj)
+            parsed = parse_json_object(msg)
+            if parsed:
+                return True, {
+                    "ok": True,
+                    "status": status,
+                    "raw": msg,
+                    "json": parsed,
+                    "usage": obj.get("usage", {}),
+                    "resolved_model": model_id,
+                    "resolved_endpoint": "responses",
+                }
+            return False, {"error": f"{model_id}: responses non-json", "raw": raw[:240], "status": status}
+        return False, {"error": f"{model_id}: responses status={status} raw={raw[:240]}", "raw": raw[:240], "status": status}
+
+    def _try_chat(self, model_id: str, prompt: str, b64: str, max_output_tokens: int) -> Tuple[bool, Dict[str, Any]]:
+        headers = {
+            "Authorization": f"Bearer {self.profile.api_key}",
+            "Content-Type": "application/json",
+        }
+        _ = headers
+        payload_openai = {
+            "model": model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": max_output_tokens,
+        }
+        status, obj, raw = self._post_chat(payload_openai)
+        if status == 200 and obj:
+            msg = self._extract_chat_text(obj)
+            parsed = parse_json_object(msg)
+            if parsed:
+                return True, {
+                    "ok": True,
+                    "status": status,
+                    "raw": msg,
+                    "json": parsed,
+                    "usage": obj.get("usage", {}),
+                    "resolved_model": model_id,
+                    "resolved_endpoint": "chat_completions",
+                }
+        payload_alt = {
+            "model": model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": b64,
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": max_output_tokens,
+        }
+        status2, obj2, raw2 = self._post_chat(payload_alt)
+        if status2 == 200 and obj2:
+            msg2 = self._extract_chat_text(obj2)
+            parsed2 = parse_json_object(msg2)
+            if parsed2:
+                return True, {
+                    "ok": True,
+                    "status": status2,
+                    "raw": msg2,
+                    "json": parsed2,
+                    "usage": obj2.get("usage", {}),
+                    "resolved_model": model_id,
+                    "resolved_endpoint": "chat_completions_alt",
+                }
+        err = f"{model_id}: chat status={status} raw={raw[:160]} || alt status={status2} raw={raw2[:160]}"
+        return False, {"error": err, "status": status2 if status2 != 200 else status, "raw": raw2[:240] or raw[:240]}
+
     def classify_page(
         self,
         image_jpeg: bytes,
@@ -403,16 +1211,64 @@ class OpenAICompatibleClient:
         page_no: int,
         custom_prompt: str,
         memory_notes: List[str],
+        page_cues: Optional[Dict[str, Any]] = None,
+        ocr_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         b64 = base64.b64encode(image_jpeg).decode("ascii")
         rules = ""
         if memory_notes:
             joined = "\n".join([f"- {x}" for x in memory_notes[:20]])
             rules = f"\nLearned rules from prior corrections:\n{joined}\n"
+        cues = ""
+        if page_cues:
+            cue_lines = [f"- rendered_size={page_cues.get('image_width')}x{page_cues.get('image_height')}"]
+            if page_cues.get("content_width") and page_cues.get("content_height"):
+                cue_lines.append(
+                    f"- content_bbox_size={page_cues.get('content_width')}x{page_cues.get('content_height')} "
+                    f"(ratio={page_cues.get('content_ratio')})"
+                )
+            if page_cues.get("right_boundary_x") is not None:
+                cue_lines.append(
+                    f"- estimated_right_boundary_x={page_cues.get('right_boundary_x')} "
+                    f"strength={page_cues.get('right_boundary_strength')}"
+                )
+                cue_lines.append(
+                    f"- right_of_boundary_dark_ratio={page_cues.get('right_of_boundary_dark_ratio')} "
+                    f"right_of_boundary_colmax_ratio={page_cues.get('right_of_boundary_colmax_ratio')}"
+                )
+            cue_lines.append(
+                "- heuristic_hint=normal clean card is often around 1000:447 (~2.24:1); materially wider/longer content is a strong overlap cue"
+            )
+            cue_lines.append(
+                "- heuristic_hint=if the main right page boundary is identifiable but there is still visible structure or text beyond it, treat that as strong overlap evidence"
+            )
+            cues = "\nMeasured visual cues:\n" + "\n".join(cue_lines) + "\n"
+        ocr_cues = ""
+        if ocr_info:
+            if ocr_info.get("ok"):
+                ocr_lines = [
+                    f"- local_paddleocr_text_boxes={ocr_info.get('text_box_count')}",
+                    f"- local_paddleocr_outside_right_boxes={ocr_info.get('outside_right_box_count')}",
+                    f"- local_paddleocr_outside_right_chars={ocr_info.get('outside_right_char_count')}",
+                    f"- local_paddleocr_mean_score={ocr_info.get('mean_score')}",
+                    f"- local_paddleocr_overlap_signal={ocr_info.get('strong_overlap_evidence')}",
+                    f"- local_paddleocr_blurry_signal={ocr_info.get('likely_blurry')}",
+                ]
+                examples = ocr_info.get("outside_right_examples") or []
+                if examples:
+                    ocr_lines.append(f"- local_paddleocr_outside_right_examples={' | '.join([str(x) for x in examples[:4]])}")
+                preview = str(ocr_info.get("preview_text", "")).strip()
+                if preview:
+                    ocr_lines.append(f"- local_paddleocr_preview={preview[:120]}")
+                ocr_cues = "\nLocal PaddleOCR evidence:\n" + "\n".join(ocr_lines) + "\n"
+            else:
+                ocr_cues = f"\nLocal PaddleOCR status:\n- unavailable_error={str(ocr_info.get('error', ''))[:160]}\n"
 
         prompt = (
             DEFAULT_CLASSIFY_PROMPT
             + rules
+            + cues
+            + ocr_cues
             + f"\nfile={file_name}\npage={page_no}\n"
         )
         if custom_prompt.strip():
@@ -420,76 +1276,17 @@ class OpenAICompatibleClient:
 
         errors: List[str] = []
         for model_id in self.model_candidates:
-            payload_openai = {
-                "model": model_id,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        ],
-                    }
-                ],
-                "temperature": 0,
-                "max_tokens": 320,
-            }
+            ok, result = self._try_responses(model_id, prompt, b64, 320)
+            if ok:
+                return result
+            errors.append(str(result.get("error", ""))[:220])
+            if self.responses_only:
+                continue
 
-            status, obj, raw = self._post(payload_openai)
-            if status == 200 and obj:
-                msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-                parsed = parse_json_object(msg)
-                if parsed:
-                    return {
-                        "ok": True,
-                        "status": status,
-                        "raw": msg,
-                        "json": parsed,
-                        "usage": obj.get("usage", {}),
-                        "resolved_model": model_id,
-                    }
-                errors.append(f"{model_id}: non-json(openai-shape)")
-            else:
-                errors.append(f"{model_id}: openai-shape status={status} raw={raw[:120]}")
-
-            # fallback shape for some gateways that proxy Anthropic-like format
-            payload_alt = {
-                "model": model_id,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": b64,
-                                },
-                            },
-                        ],
-                    }
-                ],
-                "temperature": 0,
-                "max_tokens": 320,
-            }
-            status2, obj2, raw2 = self._post(payload_alt)
-            if status2 == 200 and obj2:
-                msg = obj2.get("choices", [{}])[0].get("message", {}).get("content", "")
-                parsed = parse_json_object(msg)
-                if parsed:
-                    return {
-                        "ok": True,
-                        "status": status2,
-                        "raw": msg,
-                        "json": parsed,
-                        "usage": obj2.get("usage", {}),
-                        "resolved_model": model_id,
-                    }
-                errors.append(f"{model_id}: non-json(alt-shape)")
-            else:
-                errors.append(f"{model_id}: alt-shape status={status2} raw={raw2[:120]}")
+            ok, result = self._try_chat(model_id, prompt, b64, 320)
+            if ok:
+                return result
+            errors.append(str(result.get("error", ""))[:220])
 
         return {
             "ok": False,
@@ -499,34 +1296,37 @@ class OpenAICompatibleClient:
         }
 
     def quick_test(self) -> Tuple[bool, str]:
-        # 1x1 png transparent pixel
-        tiny = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc``\xf8\x0f\x00\x01\x04"
-            b"\x01\x00\x18\xdd\x8d\x18\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        b64 = base64.b64encode(tiny).decode("ascii")
+        tiny_img = Image.new("RGB", (12, 12), color="white")
+        bio = io.BytesIO()
+        tiny_img.save(bio, format="JPEG", quality=70)
+        b64 = base64.b64encode(bio.getvalue()).decode("ascii")
         errs = []
         for model_id in self.model_candidates:
             payload = {
                 "model": model_id,
-                "messages": [
+                "input": [
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "Reply exactly OK."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            {"type": "input_text", "text": "Reply exactly OK."},
+                            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
                         ],
                     }
                 ],
-                "temperature": 0,
-                "max_tokens": 8,
+                "max_output_tokens": 12,
             }
-            status, obj, raw = self._post(payload)
+            status, obj, raw = self._post_responses(payload)
             if status == 200 and obj:
-                msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return True, f"HTTP 200 via '{model_id}'. Reply: {msg[:120]!r}"
-            errs.append(f"{model_id}: {status} {raw[:80]}")
+                msg = self._extract_responses_text(obj)
+                return True, f"HTTP 200 via '{model_id}' on responses. Reply: {msg[:120]!r}"
+            errs.append(f"{model_id}: responses {status} {raw[:80]}")
+            if self.responses_only:
+                continue
+
+            ok, result = self._try_chat(model_id, "Reply exactly OK.", b64, 12)
+            if ok:
+                return True, f"HTTP 200 via '{model_id}' on {result.get('resolved_endpoint')}. Reply: {str(result.get('raw', ''))[:120]!r}"
+            errs.append(f"{model_id}: chat fallback failed")
         return False, " ; ".join(errs[:3])
 
 
@@ -539,13 +1339,15 @@ class OverlapEngine:
         cancel_event: threading.Event,
         progress_cb,
         render_dpi: int = 220,
+        ocr_assistant: Optional[PaddleOCRAssistant] = None,
     ) -> None:
         self.client = client
-        self.memory = memory
+        self.memory = ensure_memory_schema(memory)
         self.log = logger
         self.cancel_event = cancel_event
         self.progress_cb = progress_cb
         self.render_dpi = max(120, min(360, int(render_dpi)))
+        self.ocr_assistant = ocr_assistant
 
     def memory_override(self, file_name: str, page_no: int) -> Optional[Dict[str, Any]]:
         key = f"{file_name.lower()}::{page_no}"
@@ -590,9 +1392,13 @@ class OverlapEngine:
                 file_name = pdf_path.name
                 override = self.memory_override(file_name, page_no)
                 if override:
-                    override_overlap = bool(override.get("is_overlap", False))
-                    override_blurry = bool(override.get("is_blurry", False))
-                    override_decision = "overlap" if override_overlap else ("blurry" if override_blurry else "clean")
+                    override_decision = str(override.get("decision", "")).strip().lower()
+                    if override_decision not in {"overlap", "blurry", "clean", "uncertain"}:
+                        override_overlap = bool(override.get("is_overlap", False))
+                        override_blurry = bool(override.get("is_blurry", False))
+                        override_decision = "overlap" if override_overlap else ("blurry" if override_blurry else "clean")
+                    override_overlap = bool(override.get("is_overlap", override_decision == "overlap"))
+                    override_blurry = bool(override.get("is_blurry", override_decision == "blurry"))
                     rec = {
                         "source_directory": str(pdf_path.parent),
                         "file_name": file_name,
@@ -608,6 +1414,10 @@ class OverlapEngine:
                         "scope": scope,
                         "model": self.client.profile.model,
                         "resolved_model": "memory_override",
+                        "endpoint": "memory_override",
+                        "ocr_overlap_flag": False,
+                        "ocr_blurry_flag": False,
+                        "ocr_summary": "",
                         "status": "memory_override",
                         "error_detail": "",
                     }
@@ -625,6 +1435,7 @@ class OverlapEngine:
 
                 try:
                     image_jpeg = render_page_jpeg(doc[idx], dpi=self.render_dpi)
+                    page_cues = measure_page_visual_cues(image_jpeg)
                 except Exception as exc:
                     self.log(f"Render failed {pdf_path} p{page_no}: {exc}")
                     rec = {
@@ -642,6 +1453,10 @@ class OverlapEngine:
                         "scope": scope,
                         "model": self.client.profile.model,
                         "resolved_model": "",
+                        "endpoint": "",
+                        "ocr_overlap_flag": False,
+                        "ocr_blurry_flag": False,
+                        "ocr_summary": "",
                         "status": "error",
                         "error_detail": f"render_error: {exc}",
                     }
@@ -657,12 +1472,23 @@ class OverlapEngine:
                     self.progress_cb(done, max(total_pages, 1))
                     continue
 
+                ocr_info: Dict[str, Any] = {}
+                if self.ocr_assistant is not None:
+                    ocr_info = self.ocr_assistant.analyze_page(image_jpeg, page_cues)
+                    if not ocr_info.get("ok", False):
+                        self.log(
+                            f"PaddleOCR assist unavailable {file_name} p{page_no}: "
+                            f"{str(ocr_info.get('error', 'unknown'))[:180]}"
+                        )
+
                 result = self.client.classify_page(
                     image_jpeg=image_jpeg,
                     file_name=file_name,
                     page_no=page_no,
                     custom_prompt=custom_prompt,
-                    memory_notes=self.memory.get("global_notes", []),
+                    memory_notes=build_memory_notes(self.memory, file_name),
+                    page_cues=page_cues,
+                    ocr_info=ocr_info,
                 )
 
                 if not result.get("ok"):
@@ -681,6 +1507,10 @@ class OverlapEngine:
                         "scope": scope,
                         "model": self.client.profile.model,
                         "resolved_model": result.get("resolved_model", ""),
+                        "endpoint": result.get("resolved_endpoint", ""),
+                        "ocr_overlap_flag": bool(ocr_info.get("strong_overlap_evidence", False)),
+                        "ocr_blurry_flag": bool(ocr_info.get("likely_blurry", False)),
+                        "ocr_summary": ocr_summary_text(ocr_info),
                         "status": "llm_error",
                         "error_detail": f"status={result.get('status')} err={result.get('error', 'unknown')} raw={str(result.get('raw', ''))[:240]}",
                     }
@@ -710,10 +1540,15 @@ class OverlapEngine:
                         "scope": scope,
                         "model": self.client.profile.model,
                         "resolved_model": result.get("resolved_model", ""),
+                        "endpoint": result.get("resolved_endpoint", ""),
+                        "ocr_overlap_flag": bool(ocr_info.get("strong_overlap_evidence", False)),
+                        "ocr_blurry_flag": bool(ocr_info.get("likely_blurry", False)),
+                        "ocr_summary": ocr_summary_text(ocr_info),
                         "status": "ok",
                         "error_detail": "",
                     }
-                    if decision == "uncertain":
+                    rec = apply_ocr_assist_to_decision(rec, ocr_info)
+                    if rec.get("decision") == "uncertain":
                         self.log("Page result (uncertain): " + summarize_page_result(rec))
                     else:
                         self.log("Page result: " + summarize_page_result(rec))
@@ -1007,10 +1842,12 @@ def replace_overlap_pages(
 
 
 def import_training_csv(memory: Dict[str, Any], csv_path: Path) -> Tuple[int, int]:
+    ensure_memory_schema(memory)
     added = 0
     notes_added = 0
     overrides = memory.setdefault("overrides", {})
     notes = memory.setdefault("global_notes", [])
+    history = memory.setdefault("correction_history", [])
     with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
@@ -1033,8 +1870,10 @@ def import_training_csv(memory: Dict[str, Any], csv_path: Path) -> Tuple[int, in
             lbl_s = str(lbl_raw).strip().lower()
             is_overlap = lbl_s in {"1", "true", "yes", "y", "overlap", "ov"}
             is_blurry = lbl_s in {"blurry", "blur", "unreadable"}
+            decision = "overlap" if is_overlap else ("blurry" if is_blurry else "clean")
             key = f"{file_name.lower()}::{page}"
             overrides[key] = {
+                "decision": decision,
                 "is_overlap": is_overlap,
                 "is_blurry": is_blurry,
                 "confidence": 1.0,
@@ -1043,95 +1882,426 @@ def import_training_csv(memory: Dict[str, Any], csv_path: Path) -> Tuple[int, in
                 "note": note or "imported training label",
                 "updated_at": now_ts(),
             }
+            history.append(
+                {
+                    "file_name": file_name,
+                    "file_path": str(row.get("file_path", "")),
+                    "page": page,
+                    "previous_decision": "unknown",
+                    "corrected_decision": decision,
+                    "note": note or "imported training label",
+                    "signatures": [],
+                    "overlap_type": "manual_override",
+                    "updated_at": now_ts(),
+                }
+            )
             added += 1
             if note and note not in notes:
                 notes.append(note)
                 notes_added += 1
+    if len(history) > 300:
+        del history[:-300]
     return added, notes_added
 
 
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        self.ui = UI_TOKENS.copy()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1200x820")
-        self.minsize(1080, 760)
+        self.geometry("1320x860")
+        self.minsize(1160, 780)
+        self.configure(bg=self.ui["canvas"])
 
         self.storage = Storage()
         self.models = self.storage.load_models()
-        self.memory = self.storage.load_memory()
+        self.memory = ensure_memory_schema(self.storage.load_memory())
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
+        self._bg_after_id: Optional[str] = None
+
+        self._setup_fonts()
+        self._configure_styles()
+        self._build_backdrop()
 
         self._build_ui()
         self._load_defaults()
+        self.bind("<Configure>", self._on_root_configure)
+        self.after(60, self._draw_backdrop)
         self.after(150, self._drain_logs)
 
-    def _build_ui(self) -> None:
-        top = ttk.Frame(self)
-        top.pack(fill=tk.X, padx=10, pady=8)
+    def _setup_fonts(self) -> None:
+        available = {name.lower(): name for name in tkfont.families()}
 
-        ttk.Label(top, text="Model Profile").grid(row=0, column=0, sticky="w")
+        def pick(*candidates: str) -> str:
+            for candidate in candidates:
+                if candidate.lower() in available:
+                    return available[candidate.lower()]
+            return "TkDefaultFont"
+
+        self.font_ui = tkfont.Font(family=pick("Aptos", "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue"), size=10)
+        self.font_small = tkfont.Font(family=self.font_ui.actual("family"), size=9)
+        self.font_label = tkfont.Font(family=self.font_ui.actual("family"), size=9, weight="bold")
+        self.font_title = tkfont.Font(family=pick("Aptos Display", "Segoe UI Variable Display", "Bahnschrift", "Helvetica Neue"), size=23, weight="normal")
+        self.font_heading = tkfont.Font(family=self.font_ui.actual("family"), size=12, weight="bold")
+        self.font_overline = tkfont.Font(family=self.font_ui.actual("family"), size=9, weight="bold")
+        self.font_status = tkfont.Font(family=self.font_ui.actual("family"), size=10)
+        self.font_caption = tkfont.Font(family=self.font_ui.actual("family"), size=9)
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        self.option_add("*Font", self.font_ui)
+        self.option_add("*TCombobox*Listbox.font", self.font_ui)
+        style.configure(".", background=self.ui["canvas"], foreground=self.ui["ink"])
+        style.configure(
+            "Glass.TEntry",
+            fieldbackground=self.ui["card_strong"],
+            background=self.ui["card_strong"],
+            foreground=self.ui["ink"],
+            bordercolor=self.ui["line"],
+            lightcolor=self.ui["line"],
+            darkcolor=self.ui["line"],
+            insertcolor=self.ui["ink"],
+            padding=(10, 8),
+            relief="flat",
+        )
+        style.configure(
+            "Glass.TCombobox",
+            fieldbackground=self.ui["card_strong"],
+            background=self.ui["card_strong"],
+            foreground=self.ui["ink"],
+            bordercolor=self.ui["line"],
+            lightcolor=self.ui["line"],
+            darkcolor=self.ui["line"],
+            arrowcolor=self.ui["ink_soft"],
+            padding=(10, 8),
+            relief="flat",
+        )
+        style.map(
+            "Glass.TCombobox",
+            fieldbackground=[("readonly", self.ui["card_strong"])],
+            background=[("readonly", self.ui["card_strong"])],
+            foreground=[("readonly", self.ui["ink"])],
+        )
+        style.configure(
+            "Glass.TButton",
+            background=self.ui["card_soft"],
+            foreground=self.ui["ink"],
+            bordercolor=self.ui["line"],
+            lightcolor=self.ui["line"],
+            darkcolor=self.ui["line"],
+            focuscolor=self.ui["card_soft"],
+            padding=(12, 8),
+            relief="flat",
+        )
+        style.map(
+            "Glass.TButton",
+            background=[("active", self.ui["card_strong"]), ("pressed", self.ui["card_soft"])],
+            bordercolor=[("active", self.ui["accent"])],
+        )
+        style.configure(
+            "Accent.TButton",
+            background=self.ui["run"],
+            foreground=self.ui["card_strong"],
+            bordercolor=self.ui["run"],
+            lightcolor=self.ui["run"],
+            darkcolor=self.ui["run"],
+            focuscolor=self.ui["run"],
+            padding=(14, 9),
+            relief="flat",
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", self.ui["accent"]), ("pressed", self.ui["run"])],
+            foreground=[("active", self.ui["card_strong"])],
+        )
+        style.configure(
+            "Danger.TButton",
+            background=self.ui["danger"],
+            foreground=self.ui["card_strong"],
+            bordercolor=self.ui["danger"],
+            lightcolor=self.ui["danger"],
+            darkcolor=self.ui["danger"],
+            focuscolor=self.ui["danger"],
+            padding=(14, 9),
+            relief="flat",
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#C0857F"), ("pressed", self.ui["danger"])],
+            foreground=[("active", self.ui["card_strong"])],
+        )
+        style.configure(
+            "Glass.Horizontal.TProgressbar",
+            troughcolor=self.ui["card_soft"],
+            background=self.ui["accent"],
+            bordercolor=self.ui["line"],
+            lightcolor=self.ui["accent"],
+            darkcolor=self.ui["accent"],
+            thickness=10,
+        )
+
+    def _build_backdrop(self) -> None:
+        self.backdrop = tk.Canvas(self, bg=self.ui["canvas"], highlightthickness=0, bd=0)
+        self.backdrop.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.backdrop.lower()
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        if self._bg_after_id:
+            try:
+                self.after_cancel(self._bg_after_id)
+            except Exception:
+                pass
+        self._bg_after_id = self.after(20, self._draw_backdrop)
+
+    def _draw_backdrop(self) -> None:
+        self._bg_after_id = None
+        w = max(self.winfo_width(), 1)
+        h = max(self.winfo_height(), 1)
+        self.backdrop.delete("all")
+        self.backdrop.create_rectangle(0, 0, w, h, fill=self.ui["canvas"], outline="")
+        self.backdrop.create_oval(-140, int(h * 0.08), int(w * 0.42), int(h * 0.82), fill=self.ui["ice_soft"], outline="")
+        self.backdrop.create_oval(int(w * 0.26), -140, int(w * 0.92), int(h * 0.54), fill=self.ui["rose_soft"], outline="")
+        self.backdrop.create_oval(int(w * 0.68), int(h * 0.42), int(w + 120), h + 120, fill=self.ui["sand_soft"], outline="")
+        self.backdrop.create_oval(int(w * 0.72), -60, w + 140, int(h * 0.38), fill=self.ui["ice_soft"], outline="")
+
+    def _create_card(self, parent: tk.Widget, title: str, subtitle: str = "", badge: str = "") -> Tuple[tk.Frame, tk.Frame]:
+        card = tk.Frame(parent, bg=self.ui["card"], highlightbackground=self.ui["line"], highlightthickness=1, bd=0)
+        header = tk.Frame(card, bg=self.ui["card"])
+        header.pack(fill=tk.X, padx=18, pady=(16, 10))
+
+        title_box = tk.Frame(header, bg=self.ui["card"])
+        title_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(title_box, text=title, font=self.font_heading, fg=self.ui["ink"], bg=self.ui["card"]).pack(anchor="w")
+        if subtitle:
+            tk.Label(
+                title_box,
+                text=subtitle,
+                font=self.font_caption,
+                fg=self.ui["muted"],
+                bg=self.ui["card"],
+                wraplength=720,
+                justify="left",
+            ).pack(anchor="w", pady=(4, 0))
+        if badge:
+            self._make_pill(header, badge, self.ui["accent_soft"], self.ui["accent"]).pack(side=tk.RIGHT, padx=(12, 0))
+
+        body = tk.Frame(card, bg=self.ui["card"])
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 18))
+        return card, body
+
+    def _create_soft_panel(self, parent: tk.Widget, title: str) -> tk.Frame:
+        panel = tk.Frame(parent, bg=self.ui["card_soft"], highlightbackground=self.ui["line_soft"], highlightthickness=1, bd=0)
+        tk.Label(panel, text=title, font=self.font_label, fg=self.ui["ink_soft"], bg=self.ui["card_soft"]).pack(anchor="w", padx=14, pady=(12, 8))
+        return panel
+
+    def _make_pill(self, parent: tk.Widget, text: str, bg: str, fg: str) -> tk.Label:
+        return tk.Label(
+            parent,
+            text=text,
+            font=self.font_small,
+            fg=fg,
+            bg=bg,
+            padx=10,
+            pady=5,
+            bd=0,
+        )
+
+    def _make_field_label(self, parent: tk.Widget, text: str) -> tk.Label:
+        return tk.Label(parent, text=text, font=self.font_label, fg=self.ui["ink_soft"], bg=parent.cget("bg"))
+
+    def _make_check(
+        self,
+        parent: tk.Widget,
+        text: str,
+        variable: tk.BooleanVar,
+        command: Optional[Callable[[], None]] = None,
+    ) -> tk.Checkbutton:
+        return tk.Checkbutton(
+            parent,
+            text=text,
+            variable=variable,
+            command=command,
+            bg=parent.cget("bg"),
+            activebackground=parent.cget("bg"),
+            fg=self.ui["ink"],
+            activeforeground=self.ui["ink"],
+            selectcolor=self.ui["card_strong"],
+            highlightthickness=0,
+            bd=0,
+            padx=2,
+            pady=4,
+            font=self.font_ui,
+        )
+
+    def _style_text_widget(self, widget: ScrolledText) -> None:
+        widget.configure(
+            bg=self.ui["card_strong"],
+            fg=self.ui["ink"],
+            insertbackground=self.ui["ink"],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground=self.ui["line"],
+            wrap=tk.WORD,
+        )
+        try:
+            widget.vbar.configure(
+                bg=self.ui["card_soft"],
+                activebackground=self.ui["accent_soft"],
+                troughcolor=self.ui["canvas_soft"],
+                relief="flat",
+                bd=0,
+                width=11,
+            )
+        except Exception:
+            pass
+
+    def _set_status(self, text: str) -> None:
+        self.after(0, lambda: self.status_var.set(text))
+
+    def _build_ui(self) -> None:
+        self.shell = tk.Frame(self, bg=self.ui["canvas"])
+        self.shell.pack(fill=tk.BOTH, expand=True, padx=28, pady=24)
+        self.shell.columnconfigure(0, weight=1)
+        self.shell.rowconfigure(1, weight=1)
+
+        hero_card, hero_body = self._create_card(
+            self.shell,
+            "A calmer liquid-glass shell for overlap review",
+            "Hybrid workflow for microfiche transcript PDFs. LLM vision remains the main judge, and local PaddleOCR can add right-boundary evidence while scanning.",
+            f"v{APP_VERSION}",
+        )
+        hero_card.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        tk.Label(hero_body, text="MICROFICHE VISION WORKFLOW", font=self.font_overline, fg=self.ui["muted"], bg=self.ui["card"]).pack(anchor="w")
+        pill_row = tk.Frame(hero_body, bg=self.ui["card"])
+        pill_row.pack(anchor="w", pady=(14, 0))
+        self._make_pill(pill_row, "LLM + local PaddleOCR assist", self.ui["accent_soft"], self.ui["accent"]).pack(side=tk.LEFT, padx=(0, 8))
+        self._make_pill(pill_row, "Live O_ / B_ / E_ output", self.ui["rose_soft"], self.ui["ink"]).pack(side=tk.LEFT, padx=(0, 8))
+        self._make_pill(pill_row, "Per-page decision log", self.ui["sand_soft"], self.ui["ink_soft"]).pack(side=tk.LEFT)
+
+        dashboard = tk.Frame(self.shell, bg=self.ui["canvas"])
+        dashboard.grid(row=1, column=0, sticky="nsew")
+        dashboard.columnconfigure(0, weight=3)
+        dashboard.columnconfigure(1, weight=2)
+        dashboard.rowconfigure(3, weight=1)
+
+        model_card, model_body = self._create_card(
+            dashboard,
+            "Model Profiles",
+            "Display names stay simple. Profiles can point to remote API providers or local OpenAI-compatible VLM endpoints such as Ollama or vLLM.",
+        )
+        model_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
+        model_body.columnconfigure(1, weight=1)
+        model_body.columnconfigure(3, weight=1)
+
         self.model_name_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(top, textvariable=self.model_name_var, state="readonly", width=40)
-        self.model_combo.grid(row=0, column=1, sticky="we", padx=6)
+        self._make_field_label(model_body, "Profile").grid(row=0, column=0, sticky="w")
+        self.model_combo = ttk.Combobox(model_body, textvariable=self.model_name_var, state="readonly", style="Glass.TCombobox", width=38)
+        self.model_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10))
         self.model_combo.bind("<<ComboboxSelected>>", self.on_select_model)
 
-        self.add_model_btn = ttk.Button(top, text="Add Model", command=self.add_model)
-        self.add_model_btn.grid(row=0, column=2, padx=4)
-        self.del_model_btn = ttk.Button(top, text="Delete Model", command=self.delete_model)
-        self.del_model_btn.grid(row=0, column=3, padx=4)
-        self.save_model_btn = ttk.Button(top, text="Save Model", command=self.save_model)
-        self.save_model_btn.grid(row=0, column=4, padx=4)
-        self.test_model_btn = ttk.Button(top, text="Test Model", command=self.test_model)
-        self.test_model_btn.grid(row=0, column=5, padx=4)
+        btn_strip = tk.Frame(model_body, bg=self.ui["card"])
+        btn_strip.grid(row=0, column=2, columnspan=2, sticky="e")
+        self.add_model_btn = ttk.Button(btn_strip, text="Add", style="Glass.TButton", command=self.add_model)
+        self.add_model_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.del_model_btn = ttk.Button(btn_strip, text="Delete", style="Glass.TButton", command=self.delete_model)
+        self.del_model_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.save_model_btn = ttk.Button(btn_strip, text="Save", style="Glass.TButton", command=self.save_model)
+        self.save_model_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.test_model_btn = ttk.Button(btn_strip, text="Test", style="Glass.TButton", command=self.test_model)
+        self.test_model_btn.pack(side=tk.LEFT)
 
-        ttk.Label(top, text="Base URL").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self._make_field_label(model_body, "Base URL").grid(row=1, column=0, sticky="w", pady=(14, 0))
         self.base_url_var = tk.StringVar()
-        self.base_url_entry = ttk.Entry(top, textvariable=self.base_url_var, width=88)
-        self.base_url_entry.grid(row=1, column=1, columnspan=5, sticky="we", padx=6, pady=(8, 0))
+        self.show_sensitive_var = tk.BooleanVar(value=False)
+        self.base_url_entry = ttk.Entry(model_body, textvariable=self.base_url_var, style="Glass.TEntry", show="*")
+        self.base_url_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(14, 0))
+        self._make_check(
+            model_body,
+            "Show base URL / API key",
+            self.show_sensitive_var,
+            command=self.toggle_sensitive_fields,
+        ).grid(row=1, column=4, sticky="e", padx=(10, 0), pady=(14, 0))
 
-        ttk.Label(top, text="Model Name").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self._make_field_label(model_body, "Model Name").grid(row=2, column=0, sticky="w", pady=(14, 0))
         self.model_id_var = tk.StringVar()
-        self.model_id_entry = ttk.Entry(top, textvariable=self.model_id_var, width=35)
-        self.model_id_entry.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+        self.model_id_entry = ttk.Entry(model_body, textvariable=self.model_id_var, style="Glass.TEntry")
+        self.model_id_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(14, 0))
 
-        ttk.Label(top, text="API Key").grid(row=2, column=2, sticky="e", pady=(6, 0))
+        self._make_field_label(model_body, "API Key (optional)").grid(row=2, column=2, sticky="w", pady=(14, 0))
         self.api_key_var = tk.StringVar()
-        self.api_key_entry = ttk.Entry(top, textvariable=self.api_key_var, show="*", width=40)
-        self.api_key_entry.grid(row=2, column=3, sticky="we", padx=6, pady=(6, 0))
+        self.api_key_entry = ttk.Entry(model_body, textvariable=self.api_key_var, show="*", style="Glass.TEntry")
+        self.api_key_entry.grid(row=2, column=3, sticky="ew", pady=(14, 0))
 
-        ttk.Label(top, text="Timeout(s)").grid(row=2, column=4, sticky="e", pady=(6, 0))
+        self._make_field_label(model_body, "Timeout(s)").grid(row=3, column=0, sticky="w", pady=(14, 0))
         self.timeout_var = tk.StringVar(value="120")
-        self.timeout_entry = ttk.Entry(top, textvariable=self.timeout_var, width=8)
-        self.timeout_entry.grid(row=2, column=5, sticky="w", padx=6, pady=(6, 0))
+        self.timeout_entry = ttk.Entry(model_body, textvariable=self.timeout_var, style="Glass.TEntry", width=10)
+        self.timeout_entry.grid(row=3, column=1, sticky="w", pady=(14, 0))
+        tk.Label(
+            model_body,
+            text="Use a vision-capable model. Remote pools usually need an API key. Local OpenAI-compatible endpoints can leave API key empty.",
+            font=self.font_caption,
+            fg=self.ui["muted"],
+            bg=self.ui["card"],
+        ).grid(row=3, column=2, columnspan=2, sticky="e", pady=(14, 0))
 
-        top.columnconfigure(1, weight=1)
-        top.columnconfigure(3, weight=1)
+        run_card, run_body = self._create_card(
+            dashboard,
+            "Run Control",
+            "Run and stop the selected workflow. Progress and status update without waiting for the full batch to finish.",
+        )
+        run_card.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
+        self.status_var = tk.StringVar(value="Ready. Identify overlap or blurry pages with the selected model.")
+        self._make_pill(run_body, "Overlap / Blurry / Clean / Uncertain", self.ui["accent_soft"], self.ui["ink"]).pack(anchor="w")
+        tk.Label(
+            run_body,
+            textvariable=self.status_var,
+            font=self.font_status,
+            fg=self.ui["ink_soft"],
+            bg=self.ui["card"],
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", pady=(12, 14))
+        run_buttons = tk.Frame(run_body, bg=self.ui["card"])
+        run_buttons.pack(fill=tk.X)
+        self.run_btn = ttk.Button(run_buttons, text="Run", style="Accent.TButton", command=self.run_pipeline)
+        self.run_btn.pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(run_buttons, text="Stop", style="Danger.TButton", command=self.stop_pipeline)
+        self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.progress = ttk.Progressbar(run_body, mode="determinate", style="Glass.Horizontal.TProgressbar")
+        self.progress.pack(fill=tk.X, pady=(16, 10))
+        tk.Label(
+            run_body,
+            text="Logs will explicitly tell you whether a page was identified as overlap, blurry, clean, uncertain, or failed due to a request/model error.",
+            font=self.font_caption,
+            fg=self.ui["muted"],
+            bg=self.ui["card"],
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w")
 
-        scan_frame = ttk.LabelFrame(self, text="Scan + Actions")
-        scan_frame.pack(fill=tk.X, padx=10, pady=8)
+        scan_card, scan_body = self._create_card(
+            dashboard,
+            "Scan Sources And Actions",
+            "Choose the source folder, optional replacement folder, and which outputs to generate while the run is active.",
+        )
+        scan_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        scan_body.columnconfigure(1, weight=1)
 
-        ttk.Label(scan_frame, text="Source Directory").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         self.source_dir_var = tk.StringVar()
-        self.source_dir_entry = ttk.Entry(scan_frame, textvariable=self.source_dir_var, width=90)
-        self.source_dir_entry.grid(row=0, column=1, sticky="we", padx=6, pady=6)
-        ttk.Button(scan_frame, text="Browse", command=self.pick_source_dir).grid(row=0, column=2, padx=6)
-
-        ttk.Label(scan_frame, text="Replacement Directory (optional)").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         self.replacement_dir_var = tk.StringVar()
-        self.replacement_dir_entry = ttk.Entry(scan_frame, textvariable=self.replacement_dir_var, width=90)
-        self.replacement_dir_entry.grid(row=1, column=1, sticky="we", padx=6, pady=6)
-        ttk.Button(scan_frame, text="Browse", command=self.pick_replacement_dir).grid(row=1, column=2, padx=6)
-
-        ttk.Label(scan_frame, text="CSV Output Path").grid(row=2, column=0, sticky="w", padx=6, pady=6)
         self.csv_path_var = tk.StringVar()
-        self.csv_path_entry = ttk.Entry(scan_frame, textvariable=self.csv_path_var, width=90)
-        self.csv_path_entry.grid(row=2, column=1, sticky="we", padx=6, pady=6)
-        ttk.Button(scan_frame, text="Pick", command=self.pick_csv_path).grid(row=2, column=2, padx=6)
-
         self.recursive_var = tk.BooleanVar(value=False)
         self.act_csv_var = tk.BooleanVar(value=True)
         self.act_identify_var = tk.BooleanVar(value=True)
@@ -1140,49 +2310,88 @@ class App(tk.Tk):
         self.act_blurry_var = tk.BooleanVar(value=False)
         self.live_output_var = tk.BooleanVar(value=True)
         self.fast_mode_var = tk.BooleanVar(value=False)
+        self.paddle_assist_var = tk.BooleanVar(value=True)
 
-        row3 = ttk.Frame(scan_frame)
-        row3.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=4)
-        ttk.Checkbutton(row3, text="Recursive scan", variable=self.recursive_var).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(row3, text="Live output while scanning", variable=self.live_output_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row3, text="Fast mode (lower DPI)", variable=self.fast_mode_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row3, text="1) Generate overlap CSV", variable=self.act_csv_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row3, text="2) Export O_*.pdf pages", variable=self.act_identify_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row3, text="3) Export E_*.pdf (remove overlaps)", variable=self.act_extract_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row3, text="4) Replace overlaps -> R_*.pdf", variable=self.act_replace_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row3, text="5) Export B_*.pdf blurry pages", variable=self.act_blurry_var).pack(side=tk.LEFT, padx=8)
+        self._make_field_label(scan_body, "Source Directory").grid(row=0, column=0, sticky="w")
+        self.source_dir_entry = ttk.Entry(scan_body, textvariable=self.source_dir_var, style="Glass.TEntry")
+        self.source_dir_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ttk.Button(scan_body, text="Browse", style="Glass.TButton", command=self.pick_source_dir).grid(row=0, column=2, sticky="e")
 
-        scan_frame.columnconfigure(1, weight=1)
+        self._make_field_label(scan_body, "Replacement Directory (optional)").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        self.replacement_dir_entry = ttk.Entry(scan_body, textvariable=self.replacement_dir_var, style="Glass.TEntry")
+        self.replacement_dir_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(12, 0))
+        ttk.Button(scan_body, text="Browse", style="Glass.TButton", command=self.pick_replacement_dir).grid(row=1, column=2, sticky="e", pady=(12, 0))
 
-        prompt_frame = ttk.LabelFrame(self, text="Custom Prompt (optional)")
-        prompt_frame.pack(fill=tk.BOTH, padx=10, pady=8)
-        self.prompt_text = ScrolledText(prompt_frame, height=7)
-        self.prompt_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._make_field_label(scan_body, "CSV Output Path").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.csv_path_entry = ttk.Entry(scan_body, textvariable=self.csv_path_var, style="Glass.TEntry")
+        self.csv_path_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(12, 0))
+        ttk.Button(scan_body, text="Pick", style="Glass.TButton", command=self.pick_csv_path).grid(row=2, column=2, sticky="e", pady=(12, 0))
 
-        mem_frame = ttk.LabelFrame(self, text="Memory / Training")
-        mem_frame.pack(fill=tk.X, padx=10, pady=8)
+        options_row = tk.Frame(scan_body, bg=self.ui["card"])
+        options_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        options_row.columnconfigure(0, weight=1)
+        options_row.columnconfigure(1, weight=1)
 
-        ttk.Button(mem_frame, text="Import Training CSV", command=self.import_training).grid(row=0, column=0, padx=6, pady=6)
-        ttk.Button(mem_frame, text="Add Memory Note", command=self.add_memory_note).grid(row=0, column=1, padx=6, pady=6)
-        ttk.Button(mem_frame, text="Save Memory", command=self.save_memory).grid(row=0, column=2, padx=6, pady=6)
-        ttk.Button(mem_frame, text="Show Memory Stats", command=self.show_memory_stats).grid(row=0, column=3, padx=6, pady=6)
+        mode_panel = self._create_soft_panel(options_row, "Mode")
+        mode_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self._make_check(mode_panel, "Recursive scan", self.recursive_var).pack(anchor="w", padx=12)
+        self._make_check(mode_panel, "Live output while scanning", self.live_output_var).pack(anchor="w", padx=12)
+        self._make_check(mode_panel, "Use local PaddleOCR assist", self.paddle_assist_var).pack(anchor="w", padx=12)
+        self._make_check(mode_panel, "Fast mode (lower DPI)", self.fast_mode_var).pack(anchor="w", padx=12, pady=(0, 10))
 
+        action_panel = self._create_soft_panel(options_row, "Outputs")
+        action_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self._make_check(action_panel, "1) Generate overlap CSV", self.act_csv_var).pack(anchor="w", padx=12)
+        self._make_check(action_panel, "2) Export O_*.pdf pages", self.act_identify_var).pack(anchor="w", padx=12)
+        self._make_check(action_panel, "3) Export E_*.pdf (remove overlaps)", self.act_extract_var).pack(anchor="w", padx=12)
+        self._make_check(action_panel, "4) Replace overlaps -> R_*.pdf", self.act_replace_var).pack(anchor="w", padx=12)
+        self._make_check(action_panel, "5) Export B_*.pdf blurry pages", self.act_blurry_var).pack(anchor="w", padx=12, pady=(0, 10))
+
+        prompt_card, prompt_body = self._create_card(
+            dashboard,
+            "Custom Prompt",
+            "Use this only for edge cases. The built-in prompt already defines overlap and blurry behavior.",
+        )
+        prompt_card.grid(row=2, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
+        self.prompt_text = ScrolledText(prompt_body, height=9)
+        self.prompt_text.pack(fill=tk.BOTH, expand=True)
+        self._style_text_widget(self.prompt_text)
+
+        mem_card, mem_body = self._create_card(
+            dashboard,
+            "Memory And Training",
+            "Store corrections and persistent notes so future runs keep the same judgement style for your dataset.",
+        )
+        mem_card.grid(row=2, column=1, sticky="nsew", pady=(0, 10))
+        mem_body.columnconfigure(0, weight=1)
+        mem_body.columnconfigure(1, weight=1)
+        ttk.Button(mem_body, text="Import Training CSV", style="Glass.TButton", command=self.import_training).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+        ttk.Button(mem_body, text="Add Memory Note", style="Glass.TButton", command=self.add_memory_note).grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        ttk.Button(mem_body, text="Correct Last Scan Page", style="Glass.TButton", command=self.correct_last_scan_page).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+        ttk.Button(mem_body, text="Save Memory", style="Glass.TButton", command=self.save_memory).grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        ttk.Button(mem_body, text="Show Memory Stats", style="Glass.TButton", command=self.show_memory_stats).grid(row=2, column=0, columnspan=2, sticky="ew")
         self.memory_info_var = tk.StringVar(value="Memory: 0 notes, 0 overrides")
-        ttk.Label(mem_frame, textvariable=self.memory_info_var).grid(row=0, column=4, padx=8, pady=6, sticky="w")
+        tk.Label(
+            mem_body,
+            textvariable=self.memory_info_var,
+            font=self.font_caption,
+            fg=self.ui["muted"],
+            bg=self.ui["card"],
+            wraplength=340,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
-        run_frame = ttk.Frame(self)
-        run_frame.pack(fill=tk.X, padx=10, pady=8)
-        self.run_btn = ttk.Button(run_frame, text="Run", command=self.run_pipeline)
-        self.run_btn.pack(side=tk.LEFT, padx=4)
-        self.stop_btn = ttk.Button(run_frame, text="Stop", command=self.stop_pipeline)
-        self.stop_btn.pack(side=tk.LEFT, padx=4)
-        self.progress = ttk.Progressbar(run_frame, mode="determinate")
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
-
-        log_frame = ttk.LabelFrame(self, text="Log")
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        self.log_text = ScrolledText(log_frame, height=14)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        log_card, log_body = self._create_card(
+            dashboard,
+            "Execution Log",
+            "Per-page decisions and model failures are written here. This is the first place to check if a request times out or the model returns an uncertain answer.",
+        )
+        log_card.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        log_body.rowconfigure(0, weight=1)
+        log_body.columnconfigure(0, weight=1)
+        self.log_text = ScrolledText(log_body, height=15)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self._style_text_widget(self.log_text)
 
     def _load_defaults(self) -> None:
         names = [m.name for m in self.models]
@@ -1199,7 +2408,13 @@ class App(tk.Tk):
     def _refresh_memory_info(self) -> None:
         notes = len(self.memory.get("global_notes", []))
         overrides = len(self.memory.get("overrides", {}))
-        self.memory_info_var.set(f"Memory: {notes} notes, {overrides} overrides")
+        corrections = len(self.memory.get("correction_history", []))
+        self.memory_info_var.set(f"Memory: {notes} notes, {overrides} overrides, {corrections} corrections")
+
+    def toggle_sensitive_fields(self) -> None:
+        show_char = "" if self.show_sensitive_var.get() else "*"
+        self.base_url_entry.configure(show=show_char)
+        self.api_key_entry.configure(show=show_char)
 
     def _drain_logs(self) -> None:
         try:
@@ -1243,12 +2458,12 @@ class App(tk.Tk):
             return
         model = simpledialog.askstring(
             "Add Model",
-            "Model Name / Alias (for built-ins use names like GPT-5.3, Kimi-K2.5):",
+            "Model Name / Alias (for built-ins use names like GPT-5.4, Kimi-K2.5; for local endpoints use the local model id):",
             parent=self,
         )
         if not model:
             return
-        api_key = simpledialog.askstring("Add Model", "API Key (optional):", parent=self, show="*") or ""
+        api_key = simpledialog.askstring("Add Model", "API Key (optional; leave blank for local endpoints):", parent=self, show="*") or ""
         timeout = simpledialog.askinteger("Add Model", "Timeout seconds:", initialvalue=120, parent=self)
         timeout = timeout or 120
 
@@ -1323,17 +2538,17 @@ class App(tk.Tk):
         if not profile:
             messagebox.showerror("Error", "No model selected.")
             return
-        if not profile.api_key:
-            messagebox.showerror("Error", "API key is empty.")
-            return
 
         def worker() -> None:
+            self._set_status(f"Testing model connectivity for {profile.name}...")
             self.log(f"Testing model: {profile.name} / {profile.model}")
             client = OpenAICompatibleClient(profile)
             ok, msg = client.quick_test()
             if ok:
+                self._set_status(f"Model test passed for {profile.name}.")
                 self.log(f"Model test OK: {msg}")
             else:
+                self._set_status(f"Model test failed for {profile.name}. Check log.")
                 self.log(f"Model test failed: {msg}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1375,6 +2590,13 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
 
+    def correct_last_scan_page(self) -> None:
+        last_scan = self.storage.load_last_scan()
+        if not last_scan:
+            messagebox.showerror("No Scan Data", "No last_scan.json found. Run a scan first.")
+            return
+        CorrectionPicker(self, last_scan)
+
     def add_memory_note(self) -> None:
         note = simpledialog.askstring(
             "Add Memory Note",
@@ -1402,10 +2624,15 @@ class App(tk.Tk):
     def show_memory_stats(self) -> None:
         notes = len(self.memory.get("global_notes", []))
         overrides = len(self.memory.get("overrides", {}))
-        messagebox.showinfo("Memory Stats", f"Global notes: {notes}\nOverrides: {overrides}")
+        corrections = len(self.memory.get("correction_history", []))
+        messagebox.showinfo(
+            "Memory Stats",
+            f"Global notes: {notes}\nOverrides: {overrides}\nCorrections: {corrections}",
+        )
 
     def stop_pipeline(self) -> None:
         self.cancel_event.set()
+        self._set_status("Stop requested. Finishing the current request before shutdown.")
         self.log("Stop requested.")
 
     def run_pipeline(self) -> None:
@@ -1416,9 +2643,6 @@ class App(tk.Tk):
         profile = self.current_profile()
         if not profile:
             messagebox.showerror("Error", "No model selected.")
-            return
-        if not profile.api_key:
-            messagebox.showerror("Error", "API key is empty.")
             return
 
         source_dir = Path(self.source_dir_var.get().strip())
@@ -1434,10 +2658,12 @@ class App(tk.Tk):
         recursive = bool(self.recursive_var.get())
         live_output = bool(self.live_output_var.get())
         fast_mode = bool(self.fast_mode_var.get())
+        paddle_assist_enabled = bool(self.paddle_assist_var.get())
         render_dpi = 170 if fast_mode else 220
 
         self.cancel_event.clear()
         self.progress["value"] = 0
+        self._set_status(f"Starting {profile.name} scan...")
 
         def progress_cb(done: int, total: int) -> None:
             def _set() -> None:
@@ -1453,14 +2679,17 @@ class App(tk.Tk):
                 self.log(
                     "Identify overlap/blurry settings: "
                     f"live_output={live_output}, render_dpi={render_dpi}, "
+                    f"paddle_assist={paddle_assist_enabled}, "
                     f"overlap_csv={self.act_csv_var.get()}, export_O={self.act_identify_var.get()}, "
                     f"export_E={self.act_extract_var.get()}, replace_R={self.act_replace_var.get()}, "
                     f"export_B={self.act_blurry_var.get()}"
                 )
                 src_pdfs = list_pdfs(source_dir, recursive=recursive)
                 if not src_pdfs:
+                    self._set_status("No source PDFs found.")
                     self.log("No PDF files found in source directory.")
                     return
+                self._set_status(f"Scanning {len(src_pdfs)} source PDFs with {profile.name}...")
                 self.log(f"Source PDFs: {len(src_pdfs)}")
 
                 extra_pdfs: List[Path] = []
@@ -1473,6 +2702,14 @@ class App(tk.Tk):
                         self.log(f"Replacement candidate PDFs: {len(extra_pdfs)}")
 
                 client = OpenAICompatibleClient(profile)
+                ocr_assistant = PaddleOCRAssistant(self.log) if paddle_assist_enabled else None
+                if ocr_assistant is not None:
+                    ready, ocr_msg = ocr_assistant.ready()
+                    if ready:
+                        self.log("PaddleOCR assist ready.")
+                    else:
+                        self.log(f"PaddleOCR assist disabled for this run: {ocr_msg}")
+                        ocr_assistant = None
                 engine = OverlapEngine(
                     client=client,
                     memory=self.memory,
@@ -1480,6 +2717,7 @@ class App(tk.Tk):
                     cancel_event=self.cancel_event,
                     progress_cb=progress_cb,
                     render_dpi=render_dpi,
+                    ocr_assistant=ocr_assistant,
                 )
 
                 live_csv_writer: Optional[csv.DictWriter] = None
@@ -1498,6 +2736,9 @@ class App(tk.Tk):
                     nonlocal live_o_count, live_b_count
                     if rec.get("scope") != "source":
                         return
+                    decision = str(rec.get("decision") or "unknown")
+                    page_num = int(rec.get("page") or 0)
+                    self._set_status(f"{pdf_path.name} p{page_num:03d}: {decision}")
                     if live_output and self.act_csv_var.get() and live_csv_writer and live_csv_fh and rec.get("is_overlap"):
                         live_csv_writer.writerow(overlap_row_for_csv(rec))
                         live_csv_fh.flush()
@@ -1528,6 +2769,7 @@ class App(tk.Tk):
                 all_records = list(source_records)
 
                 if extra_pdfs and not self.cancel_event.is_set():
+                    self._set_status(f"Scanning {len(extra_pdfs)} replacement PDFs...")
                     self.log("Scanning replacement directory for candidate pages...")
                     extra_records = engine.scan_pdfs(extra_pdfs, scope="replacement", custom_prompt=custom_prompt)
                     all_records.extend(extra_records)
@@ -1536,6 +2778,7 @@ class App(tk.Tk):
                 self.log(f"Scan complete. Total pages processed: {len(all_records)}")
 
                 if self.cancel_event.is_set():
+                    self._set_status("Stopped before finishing output actions.")
                     self.log("Pipeline stopped before actions.")
                     return
 
@@ -1573,8 +2816,10 @@ class App(tk.Tk):
                         cnt = export_blurry_pages(source_records, self.log)
                         self.log(f"Action 5 done: exported B_ pages = {cnt}")
 
+                self._set_status("Pipeline finished. Review the log and generated files.")
                 self.log("Pipeline finished.")
             except Exception:
+                self._set_status("Pipeline crashed. Check the execution log.")
                 self.log("Pipeline crashed:\n" + traceback.format_exc())
             finally:
                 if live_csv_fh:
