@@ -46,7 +46,7 @@ python -m pip install -r requirements.txt pyinstaller >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [5/6] Build exe...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name MicroficheOverlapExtractor --collect-all paddleocr --collect-all paddlex --collect-all paddle microfiche_overlap_extractor.py >> "%LOG%" 2>&1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name MicroficheOverlapExtractor microfiche_overlap_extractor.py >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [6/6] Verify output...

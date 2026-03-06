@@ -415,221 +415,6 @@ def measure_page_visual_cues(image_jpeg: bytes) -> Dict[str, Any]:
         return {}
 
 
-def ocr_summary_text(ocr_info: Optional[Dict[str, Any]]) -> str:
-    if not ocr_info:
-        return ""
-    if not ocr_info.get("ok", False):
-        return str(ocr_info.get("error", "ocr_unavailable"))[:240]
-    bits = [
-        f"text_boxes={int(ocr_info.get('text_box_count', 0))}",
-        f"outside_right_boxes={int(ocr_info.get('outside_right_box_count', 0))}",
-        f"outside_right_chars={int(ocr_info.get('outside_right_char_count', 0))}",
-        f"mean_score={float(ocr_info.get('mean_score', 0.0)):.2f}",
-    ]
-    if ocr_info.get("strong_overlap_evidence"):
-        bits.append("strong_overlap_evidence=yes")
-    if ocr_info.get("likely_blurry"):
-        bits.append("likely_blurry=yes")
-    preview = str(ocr_info.get("preview_text", "")).strip()
-    if preview:
-        bits.append(f"preview={preview[:80]}")
-    return "; ".join(bits)
-
-
-class PaddleOCRAssistant:
-    def __init__(self, logger) -> None:
-        self.log = logger
-        self._ocr = None
-        self._np = None
-        self._init_attempted = False
-        self._init_error = ""
-
-    def _ensure_loaded(self) -> None:
-        if self._ocr is not None or self._init_attempted:
-            return
-        self._init_attempted = True
-        try:
-            os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-            import numpy as np  # type: ignore
-            from paddleocr import PaddleOCR  # type: ignore
-
-            self._np = np
-            self._ocr = PaddleOCR(
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                lang="en",
-            )
-            self.log("Local PaddleOCR assistant initialized.")
-        except Exception as exc:
-            self._init_error = f"{type(exc).__name__}: {exc}"
-            self.log(f"Local PaddleOCR assistant unavailable: {self._init_error}")
-
-    def ready(self) -> Tuple[bool, str]:
-        self._ensure_loaded()
-        if self._ocr is None:
-            return False, self._init_error or "PaddleOCR unavailable."
-        return True, "PaddleOCR ready."
-
-    @staticmethod
-    def _alnum_count(text: str) -> int:
-        return sum(1 for ch in text if ch.isalnum())
-
-    @staticmethod
-    def _box_bounds(poly: Any) -> Optional[Tuple[float, float, float, float]]:
-        try:
-            xs = [float(pt[0]) for pt in poly]
-            ys = [float(pt[1]) for pt in poly]
-            return min(xs), min(ys), max(xs), max(ys)
-        except Exception:
-            return None
-
-    def analyze_page(self, image_jpeg: bytes, page_cues: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        self._ensure_loaded()
-        if self._ocr is None or self._np is None:
-            return {
-                "ok": False,
-                "error": self._init_error or "PaddleOCR unavailable",
-                "strong_overlap_evidence": False,
-                "likely_blurry": False,
-            }
-
-        try:
-            img = Image.open(io.BytesIO(image_jpeg)).convert("RGB")
-            arr = self._np.array(img)
-            raw = self._ocr.predict(arr)
-            item = raw[0] if raw else {}
-            texts = [str(x).strip() for x in item.get("rec_texts", [])]
-            scores = [float(x) for x in item.get("rec_scores", [])]
-            polys = list(item.get("dt_polys", []) or [])
-            width, height = img.size
-
-            boundary_x = None
-            if page_cues:
-                bx = page_cues.get("right_boundary_x")
-                if bx is not None:
-                    boundary_x = int(bx)
-                elif page_cues.get("content_bbox"):
-                    bbox = page_cues["content_bbox"]
-                    try:
-                        left = int(bbox[0])
-                        right = int(bbox[2])
-                        boundary_x = left + int((right - left) * 0.68)
-                    except Exception:
-                        boundary_x = None
-            if boundary_x is None:
-                boundary_x = int(width * 0.68)
-
-            margin = max(10, int(width * 0.012))
-            readable_count = 0
-            readable_chars = 0
-            score_sum = 0.0
-            outside_boxes = 0
-            outside_chars = 0
-            outside_score_sum = 0.0
-            outside_examples: List[str] = []
-
-            for idx, poly in enumerate(polys):
-                bounds = self._box_bounds(poly)
-                if not bounds:
-                    continue
-                xmin, _ymin, _xmax, _ymax = bounds
-                text = texts[idx] if idx < len(texts) else ""
-                score = scores[idx] if idx < len(scores) else 0.0
-                text = re.sub(r"\s+", " ", text).strip()
-                alnum = self._alnum_count(text)
-                if alnum >= 2:
-                    readable_count += 1
-                    readable_chars += alnum
-                    score_sum += max(0.0, score)
-                    if xmin > boundary_x + margin:
-                        outside_boxes += 1
-                        outside_chars += alnum
-                        outside_score_sum += max(0.0, score)
-                        if text and len(outside_examples) < 4:
-                            outside_examples.append(text[:24])
-
-            mean_score = score_sum / max(readable_count, 1)
-            outside_mean_score = outside_score_sum / max(outside_boxes, 1)
-            strong_overlap = (
-                outside_boxes >= 2
-                and outside_chars >= 5
-                and (
-                    float((page_cues or {}).get("right_of_boundary_dark_ratio", 0.0)) >= 0.006
-                    or float((page_cues or {}).get("right_of_boundary_colmax_ratio", 0.0)) >= 0.03
-                    or float((page_cues or {}).get("content_ratio", 0.0)) >= 2.30
-                )
-            )
-            likely_blurry = readable_chars < 4 and mean_score < 0.25
-
-            preview_parts = [t for t in texts if self._alnum_count(t) >= 2][:6]
-            return {
-                "ok": True,
-                "boundary_x": boundary_x,
-                "text_box_count": readable_count,
-                "text_char_count": readable_chars,
-                "mean_score": round(mean_score, 3),
-                "outside_right_box_count": outside_boxes,
-                "outside_right_char_count": outside_chars,
-                "outside_right_mean_score": round(outside_mean_score, 3),
-                "outside_right_examples": outside_examples,
-                "strong_overlap_evidence": strong_overlap,
-                "likely_blurry": likely_blurry,
-                "preview_text": " | ".join(preview_parts[:4])[:160],
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "strong_overlap_evidence": False,
-                "likely_blurry": False,
-            }
-
-
-def apply_ocr_assist_to_decision(rec: Dict[str, Any], ocr_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not ocr_info:
-        return rec
-    rec["ocr_summary"] = ocr_summary_text(ocr_info)
-    rec["ocr_overlap_flag"] = bool(ocr_info.get("strong_overlap_evidence", False))
-    rec["ocr_blurry_flag"] = bool(ocr_info.get("likely_blurry", False))
-
-    if not ocr_info.get("ok", False):
-        return rec
-
-    conf = float(rec.get("confidence", 0.0))
-    if (
-        rec.get("decision") in {"clean", "uncertain"}
-        and ocr_info.get("strong_overlap_evidence")
-        and conf < 0.92
-    ):
-        rec["decision"] = "overlap"
-        rec["is_overlap"] = True
-        rec["is_blurry"] = False
-        rec["confidence"] = max(conf, 0.84)
-        if rec.get("overlap_type") in {"", "none"}:
-            rec["overlap_type"] = "clear_double_card"
-        reason = str(rec.get("reason", "")).strip()
-        ocr_reason = "local PaddleOCR found readable text beyond the estimated right page boundary"
-        rec["reason"] = f"{reason} | {ocr_reason}" if reason else ocr_reason
-        rec["status"] = "ok_ocr_assisted"
-
-    if (
-        rec.get("decision") == "uncertain"
-        and ocr_info.get("likely_blurry")
-        and not ocr_info.get("strong_overlap_evidence")
-    ):
-        rec["decision"] = "blurry"
-        rec["is_overlap"] = False
-        rec["is_blurry"] = True
-        rec["confidence"] = max(conf, 0.62)
-        reason = str(rec.get("reason", "")).strip()
-        ocr_reason = "local PaddleOCR found essentially no readable transcript text"
-        rec["reason"] = f"{reason} | {ocr_reason}" if reason else ocr_reason
-        rec["status"] = "ok_ocr_assisted"
-
-    return rec
-
-
 OVERLAP_CSV_FIELDS = [
     "source_directory",
     "file_name",
@@ -645,9 +430,6 @@ OVERLAP_CSV_FIELDS = [
     "model",
     "resolved_model",
     "endpoint",
-    "ocr_overlap_flag",
-    "ocr_blurry_flag",
-    "ocr_summary",
     "status",
     "error_detail",
 ]
@@ -688,7 +470,6 @@ def summarize_page_result(rec: Dict[str, Any]) -> str:
         f"blurry={rec.get('is_blurry')} conf={float(rec.get('confidence', 0.0)):.2f} "
         f"model={rec.get('resolved_model') or rec.get('model')} "
         f"endpoint={rec.get('endpoint', '')} "
-        f"ocr={str(rec.get('ocr_summary', ''))[:90]} "
         f"reason={str(rec.get('reason', ''))[:120]}"
     )
 
@@ -1212,7 +993,6 @@ class OpenAICompatibleClient:
         custom_prompt: str,
         memory_notes: List[str],
         page_cues: Optional[Dict[str, Any]] = None,
-        ocr_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         b64 = base64.b64encode(image_jpeg).decode("ascii")
         rules = ""
@@ -1243,32 +1023,10 @@ class OpenAICompatibleClient:
                 "- heuristic_hint=if the main right page boundary is identifiable but there is still visible structure or text beyond it, treat that as strong overlap evidence"
             )
             cues = "\nMeasured visual cues:\n" + "\n".join(cue_lines) + "\n"
-        ocr_cues = ""
-        if ocr_info:
-            if ocr_info.get("ok"):
-                ocr_lines = [
-                    f"- local_paddleocr_text_boxes={ocr_info.get('text_box_count')}",
-                    f"- local_paddleocr_outside_right_boxes={ocr_info.get('outside_right_box_count')}",
-                    f"- local_paddleocr_outside_right_chars={ocr_info.get('outside_right_char_count')}",
-                    f"- local_paddleocr_mean_score={ocr_info.get('mean_score')}",
-                    f"- local_paddleocr_overlap_signal={ocr_info.get('strong_overlap_evidence')}",
-                    f"- local_paddleocr_blurry_signal={ocr_info.get('likely_blurry')}",
-                ]
-                examples = ocr_info.get("outside_right_examples") or []
-                if examples:
-                    ocr_lines.append(f"- local_paddleocr_outside_right_examples={' | '.join([str(x) for x in examples[:4]])}")
-                preview = str(ocr_info.get("preview_text", "")).strip()
-                if preview:
-                    ocr_lines.append(f"- local_paddleocr_preview={preview[:120]}")
-                ocr_cues = "\nLocal PaddleOCR evidence:\n" + "\n".join(ocr_lines) + "\n"
-            else:
-                ocr_cues = f"\nLocal PaddleOCR status:\n- unavailable_error={str(ocr_info.get('error', ''))[:160]}\n"
-
         prompt = (
             DEFAULT_CLASSIFY_PROMPT
             + rules
             + cues
-            + ocr_cues
             + f"\nfile={file_name}\npage={page_no}\n"
         )
         if custom_prompt.strip():
@@ -1339,7 +1097,6 @@ class OverlapEngine:
         cancel_event: threading.Event,
         progress_cb,
         render_dpi: int = 220,
-        ocr_assistant: Optional[PaddleOCRAssistant] = None,
     ) -> None:
         self.client = client
         self.memory = ensure_memory_schema(memory)
@@ -1347,7 +1104,6 @@ class OverlapEngine:
         self.cancel_event = cancel_event
         self.progress_cb = progress_cb
         self.render_dpi = max(120, min(360, int(render_dpi)))
-        self.ocr_assistant = ocr_assistant
 
     def memory_override(self, file_name: str, page_no: int) -> Optional[Dict[str, Any]]:
         key = f"{file_name.lower()}::{page_no}"
@@ -1415,9 +1171,6 @@ class OverlapEngine:
                         "model": self.client.profile.model,
                         "resolved_model": "memory_override",
                         "endpoint": "memory_override",
-                        "ocr_overlap_flag": False,
-                        "ocr_blurry_flag": False,
-                        "ocr_summary": "",
                         "status": "memory_override",
                         "error_detail": "",
                     }
@@ -1454,9 +1207,6 @@ class OverlapEngine:
                         "model": self.client.profile.model,
                         "resolved_model": "",
                         "endpoint": "",
-                        "ocr_overlap_flag": False,
-                        "ocr_blurry_flag": False,
-                        "ocr_summary": "",
                         "status": "error",
                         "error_detail": f"render_error: {exc}",
                     }
@@ -1472,15 +1222,6 @@ class OverlapEngine:
                     self.progress_cb(done, max(total_pages, 1))
                     continue
 
-                ocr_info: Dict[str, Any] = {}
-                if self.ocr_assistant is not None:
-                    ocr_info = self.ocr_assistant.analyze_page(image_jpeg, page_cues)
-                    if not ocr_info.get("ok", False):
-                        self.log(
-                            f"PaddleOCR assist unavailable {file_name} p{page_no}: "
-                            f"{str(ocr_info.get('error', 'unknown'))[:180]}"
-                        )
-
                 result = self.client.classify_page(
                     image_jpeg=image_jpeg,
                     file_name=file_name,
@@ -1488,7 +1229,6 @@ class OverlapEngine:
                     custom_prompt=custom_prompt,
                     memory_notes=build_memory_notes(self.memory, file_name),
                     page_cues=page_cues,
-                    ocr_info=ocr_info,
                 )
 
                 if not result.get("ok"):
@@ -1508,9 +1248,6 @@ class OverlapEngine:
                         "model": self.client.profile.model,
                         "resolved_model": result.get("resolved_model", ""),
                         "endpoint": result.get("resolved_endpoint", ""),
-                        "ocr_overlap_flag": bool(ocr_info.get("strong_overlap_evidence", False)),
-                        "ocr_blurry_flag": bool(ocr_info.get("likely_blurry", False)),
-                        "ocr_summary": ocr_summary_text(ocr_info),
                         "status": "llm_error",
                         "error_detail": f"status={result.get('status')} err={result.get('error', 'unknown')} raw={str(result.get('raw', ''))[:240]}",
                     }
@@ -1541,13 +1278,9 @@ class OverlapEngine:
                         "model": self.client.profile.model,
                         "resolved_model": result.get("resolved_model", ""),
                         "endpoint": result.get("resolved_endpoint", ""),
-                        "ocr_overlap_flag": bool(ocr_info.get("strong_overlap_evidence", False)),
-                        "ocr_blurry_flag": bool(ocr_info.get("likely_blurry", False)),
-                        "ocr_summary": ocr_summary_text(ocr_info),
                         "status": "ok",
                         "error_detail": "",
                     }
-                    rec = apply_ocr_assist_to_decision(rec, ocr_info)
                     if rec.get("decision") == "uncertain":
                         self.log("Page result (uncertain): " + summarize_page_result(rec))
                     else:
@@ -2179,14 +1912,14 @@ class App(tk.Tk):
         hero_card, hero_body = self._create_card(
             self.shell,
             "A calmer liquid-glass shell for overlap review",
-            "Hybrid workflow for microfiche transcript PDFs. LLM vision remains the main judge, and local PaddleOCR can add right-boundary evidence while scanning.",
+            "LLM vision workflow for microfiche transcript PDFs. The classifier marks overlap, blurry, clean, or uncertain page states and can export results immediately while scanning.",
             f"v{APP_VERSION}",
         )
         hero_card.grid(row=0, column=0, sticky="ew", pady=(0, 16))
         tk.Label(hero_body, text="MICROFICHE VISION WORKFLOW", font=self.font_overline, fg=self.ui["muted"], bg=self.ui["card"]).pack(anchor="w")
         pill_row = tk.Frame(hero_body, bg=self.ui["card"])
         pill_row.pack(anchor="w", pady=(14, 0))
-        self._make_pill(pill_row, "LLM + local PaddleOCR assist", self.ui["accent_soft"], self.ui["accent"]).pack(side=tk.LEFT, padx=(0, 8))
+        self._make_pill(pill_row, "Pure LLM detection", self.ui["accent_soft"], self.ui["accent"]).pack(side=tk.LEFT, padx=(0, 8))
         self._make_pill(pill_row, "Live O_ / B_ / E_ output", self.ui["rose_soft"], self.ui["ink"]).pack(side=tk.LEFT, padx=(0, 8))
         self._make_pill(pill_row, "Per-page decision log", self.ui["sand_soft"], self.ui["ink_soft"]).pack(side=tk.LEFT)
 
@@ -2310,7 +2043,6 @@ class App(tk.Tk):
         self.act_blurry_var = tk.BooleanVar(value=False)
         self.live_output_var = tk.BooleanVar(value=True)
         self.fast_mode_var = tk.BooleanVar(value=False)
-        self.paddle_assist_var = tk.BooleanVar(value=True)
 
         self._make_field_label(scan_body, "Source Directory").grid(row=0, column=0, sticky="w")
         self.source_dir_entry = ttk.Entry(scan_body, textvariable=self.source_dir_var, style="Glass.TEntry")
@@ -2336,7 +2068,6 @@ class App(tk.Tk):
         mode_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self._make_check(mode_panel, "Recursive scan", self.recursive_var).pack(anchor="w", padx=12)
         self._make_check(mode_panel, "Live output while scanning", self.live_output_var).pack(anchor="w", padx=12)
-        self._make_check(mode_panel, "Use local PaddleOCR assist", self.paddle_assist_var).pack(anchor="w", padx=12)
         self._make_check(mode_panel, "Fast mode (lower DPI)", self.fast_mode_var).pack(anchor="w", padx=12, pady=(0, 10))
 
         action_panel = self._create_soft_panel(options_row, "Outputs")
@@ -2658,7 +2389,6 @@ class App(tk.Tk):
         recursive = bool(self.recursive_var.get())
         live_output = bool(self.live_output_var.get())
         fast_mode = bool(self.fast_mode_var.get())
-        paddle_assist_enabled = bool(self.paddle_assist_var.get())
         render_dpi = 170 if fast_mode else 220
 
         self.cancel_event.clear()
@@ -2679,7 +2409,6 @@ class App(tk.Tk):
                 self.log(
                     "Identify overlap/blurry settings: "
                     f"live_output={live_output}, render_dpi={render_dpi}, "
-                    f"paddle_assist={paddle_assist_enabled}, "
                     f"overlap_csv={self.act_csv_var.get()}, export_O={self.act_identify_var.get()}, "
                     f"export_E={self.act_extract_var.get()}, replace_R={self.act_replace_var.get()}, "
                     f"export_B={self.act_blurry_var.get()}"
@@ -2702,14 +2431,6 @@ class App(tk.Tk):
                         self.log(f"Replacement candidate PDFs: {len(extra_pdfs)}")
 
                 client = OpenAICompatibleClient(profile)
-                ocr_assistant = PaddleOCRAssistant(self.log) if paddle_assist_enabled else None
-                if ocr_assistant is not None:
-                    ready, ocr_msg = ocr_assistant.ready()
-                    if ready:
-                        self.log("PaddleOCR assist ready.")
-                    else:
-                        self.log(f"PaddleOCR assist disabled for this run: {ocr_msg}")
-                        ocr_assistant = None
                 engine = OverlapEngine(
                     client=client,
                     memory=self.memory,
@@ -2717,7 +2438,6 @@ class App(tk.Tk):
                     cancel_event=self.cancel_event,
                     progress_cb=progress_cb,
                     render_dpi=render_dpi,
-                    ocr_assistant=ocr_assistant,
                 )
 
                 live_csv_writer: Optional[csv.DictWriter] = None
