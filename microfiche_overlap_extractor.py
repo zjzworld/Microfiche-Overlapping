@@ -13,7 +13,7 @@ import threading
 import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import requests
@@ -26,16 +26,79 @@ APP_NAME = "Microfiche Overlap Extractor"
 APP_VERSION = "0.1.0"
 
 DEFAULT_CLASSIFY_PROMPT = (
-    "Task: detect microfiche page overlap.\n"
+    "Task: classify each microfiche page as overlap, blurry, clean, or uncertain.\n"
     "Definition of overlap: two different record cards are merged/superimposed in one scan, "
     "including clear side-by-side merge OR ghost/partial superimposition.\n"
+    "Definition of blurry: text is so unreadable that student name and grades cannot be recognized at all. "
+    "If any student name or any grades can be seen even partially, it is NOT blurry.\n"
+    "You must choose exactly one decision class.\n"
     "Return strict JSON only with keys:\n"
+    "- decision: one of [overlap, blurry, clean, uncertain]\n"
     "- is_overlap: boolean\n"
+    "- is_blurry: boolean\n"
     "- confidence: number in [0,1]\n"
     "- overlap_type: one of [clear_double_card, ghost_superimposition, none]\n"
     "- signatures: array of 0..2 concise identity strings (e.g. NAME|DOB|STUDENTNO)\n"
     "- reason: short string\n"
 )
+
+# Display name -> candidate real model IDs.
+# The GUI only shows display names. Request routing uses this internal mapping.
+MODEL_NAME_TO_IDS: Dict[str, List[str]] = {
+    "GPT-5.3": ["gpt-5.3", "GPT-5.3"],
+    "GPT-5.2": ["gpt-5.2", "GPT-5.2"],
+    "GPT-5.3-Codex": ["gpt-5.3-codex", "gpt-5-codex", "gpt-5.1-codex", "gpt-5-codex-mini"],
+    "Claude-Opus-4.6": ["claude-opus-4-6", "claude-opus-4-5-20251101"],
+    "Kimi-K2.5": ["kimi-k2.5"],
+    "GLM-5": ["glm-5"],
+    "MiniMax-M2.5": ["MiniMax-M2.5", "minimax-m2.5"],
+}
+
+
+def resolve_model_candidates(display_model: str) -> List[str]:
+    key = (display_model or "").strip()
+    if not key:
+        return []
+    if key in MODEL_NAME_TO_IDS:
+        return MODEL_NAME_TO_IDS[key][:]
+    # case-insensitive fallback
+    for k, ids in MODEL_NAME_TO_IDS.items():
+        if k.lower() == key.lower():
+            return ids[:]
+    # custom model profile: use as-is
+    return [key]
+
+
+def normalize_display_model_name(name: str, model: str) -> str:
+    n = (name or "").strip()
+    m = (model or "").strip()
+    # Exact match on display names.
+    if n in MODEL_NAME_TO_IDS:
+        return n
+    if m in MODEL_NAME_TO_IDS:
+        return m
+    # Reverse mapping from actual model id to display name.
+    for display, ids in MODEL_NAME_TO_IDS.items():
+        for mid in ids:
+            if mid.lower() == m.lower():
+                return display
+    # Legacy profile names created by earlier app versions.
+    legacy = n.lower()
+    if legacy.startswith("gpt-5.3"):
+        return "GPT-5.3"
+    if legacy.startswith("gpt-5.2"):
+        return "GPT-5.2"
+    if "codex" in legacy and "5.3" in legacy:
+        return "GPT-5.3-Codex"
+    if "claude-opus-4.6" in legacy or "claude-opus-4-6" in legacy:
+        return "Claude-Opus-4.6"
+    if "kimi-k2.5" in legacy:
+        return "Kimi-K2.5"
+    if legacy.startswith("glm-5"):
+        return "GLM-5"
+    if "minimax" in legacy and "2.5" in legacy:
+        return "MiniMax-M2.5"
+    return n or m
 
 
 def now_ts() -> str:
@@ -80,16 +143,24 @@ class Storage:
         try:
             raw = json.loads(self.models_path.read_text(encoding="utf-8"))
             out: List[ModelProfile] = []
+            changed = False
             for x in raw:
+                raw_name = str(x.get("name", ""))
+                raw_model = str(x.get("model", ""))
+                display_model = normalize_display_model_name(raw_name, raw_model)
+                if display_model and (raw_name != display_model or raw_model != display_model):
+                    changed = True
                 out.append(
                     ModelProfile(
-                        name=str(x.get("name", "")),
+                        name=display_model,
                         base_url=str(x.get("base_url", "")),
-                        model=str(x.get("model", "")),
+                        model=display_model,
                         api_key=str(x.get("api_key", "")),
                         timeout_sec=int(x.get("timeout_sec", 120)),
                     )
                 )
+            if changed and out:
+                self.save_models(out)
             return out or self.default_models()
         except Exception:
             return self.default_models()
@@ -137,42 +208,49 @@ class Storage:
     def default_models() -> List[ModelProfile]:
         return [
             ModelProfile(
-                name="GPT-5.3 (Third-party GPT Pool)",
+                name="GPT-5.3",
                 base_url="https://gmn.chuangzuoli.com/v1",
-                model="gpt-5.3",
+                model="GPT-5.3",
                 api_key="sk-c459a469d12f8896aeaa45ea94e0e5f7b3eafbe6fcc98dfff86fad74e724bd5d",
                 timeout_sec=120,
             ),
             ModelProfile(
-                name="GPT-5.2 (Third-party GPT Pool)",
+                name="GPT-5.2",
                 base_url="https://gmn.chuangzuoli.com/v1",
-                model="gpt-5.2",
+                model="GPT-5.2",
                 api_key="sk-c459a469d12f8896aeaa45ea94e0e5f7b3eafbe6fcc98dfff86fad74e724bd5d",
                 timeout_sec=120,
             ),
             ModelProfile(
-                name="Claude-Opus-4.6 (Third-party Claude Pool)",
+                name="GPT-5.3-Codex",
+                base_url="https://gmn.chuangzuoli.com/v1",
+                model="GPT-5.3-Codex",
+                api_key="sk-c459a469d12f8896aeaa45ea94e0e5f7b3eafbe6fcc98dfff86fad74e724bd5d",
+                timeout_sec=120,
+            ),
+            ModelProfile(
+                name="Claude-Opus-4.6",
                 base_url="https://cursor.scihub.edu.kg/api/v1",
-                model="claude-opus-4-6",
+                model="Claude-Opus-4.6",
                 api_key="cr_56c958bfb141949f0a7e3ce7bf9e83315fe7695edf95749683c05b234c594000",
                 timeout_sec=150,
             ),
             ModelProfile(
-                name="Kimi-K2.5 (Bailian)",
+                name="Kimi-K2.5",
                 base_url="https://coding.dashscope.aliyuncs.com/v1",
-                model="kimi-k2.5",
+                model="Kimi-K2.5",
                 api_key="sk-sp-a745d056ce96479c899d2b5d9c40d345",
                 timeout_sec=120,
             ),
             ModelProfile(
-                name="GLM-5 (Bailian)",
+                name="GLM-5",
                 base_url="https://coding.dashscope.aliyuncs.com/v1",
-                model="glm-5",
+                model="GLM-5",
                 api_key="sk-sp-a745d056ce96479c899d2b5d9c40d345",
                 timeout_sec=120,
             ),
             ModelProfile(
-                name="Minimax-M2.5 (Bailian)",
+                name="MiniMax-M2.5",
                 base_url="https://coding.dashscope.aliyuncs.com/v1",
                 model="MiniMax-M2.5",
                 api_key="sk-sp-a745d056ce96479c899d2b5d9c40d345",
@@ -233,9 +311,68 @@ def render_page_jpeg(page: fitz.Page, dpi: int = 220, max_width: int = 960, qual
     return bio.getvalue()
 
 
+OVERLAP_CSV_FIELDS = [
+    "source_directory",
+    "file_name",
+    "file_path",
+    "page",
+    "decision",
+    "is_overlap",
+    "is_blurry",
+    "confidence",
+    "overlap_type",
+    "signatures",
+    "reason",
+    "model",
+    "resolved_model",
+    "status",
+    "error_detail",
+]
+
+
+def overlap_row_for_csv(rec: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(rec)
+    row["signatures"] = " | ".join(rec.get("signatures", []))
+    return {k: row.get(k, "") for k in OVERLAP_CSV_FIELDS}
+
+
+def normalize_decision_fields(obj: Dict[str, Any]) -> Tuple[str, bool, bool]:
+    decision = str(obj.get("decision", "")).strip().lower()
+    is_overlap = bool(obj.get("is_overlap", False))
+    is_blurry = bool(obj.get("is_blurry", False))
+
+    if decision not in {"overlap", "blurry", "clean", "uncertain"}:
+        if is_overlap:
+            decision = "overlap"
+        elif is_blurry:
+            decision = "blurry"
+        else:
+            decision = "clean"
+
+    if decision == "overlap":
+        return decision, True, False
+    if decision == "blurry":
+        return decision, False, True
+    if decision == "clean":
+        return decision, False, False
+    return "uncertain", False, False
+
+
+def summarize_page_result(rec: Dict[str, Any]) -> str:
+    return (
+        f"{rec.get('file_name')} p{int(rec.get('page', 0)):03d}: "
+        f"decision={rec.get('decision')} overlap={rec.get('is_overlap')} "
+        f"blurry={rec.get('is_blurry')} conf={float(rec.get('confidence', 0.0)):.2f} "
+        f"model={rec.get('resolved_model') or rec.get('model')} "
+        f"reason={str(rec.get('reason', ''))[:120]}"
+    )
+
+
 class OpenAICompatibleClient:
     def __init__(self, profile: ModelProfile):
         self.profile = profile
+        alias = profile.model.strip() or profile.name.strip()
+        self.model_candidates = resolve_model_candidates(alias)
 
     def _post(self, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
         url = self.profile.base_url.rstrip("/") + "/chat/completions"
@@ -281,89 +418,84 @@ class OpenAICompatibleClient:
         if custom_prompt.strip():
             prompt += f"\nCustom instructions:\n{custom_prompt.strip()}\n"
 
-        payload_openai = {
-            "model": self.profile.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ],
-                }
-            ],
-            "temperature": 0,
-            "max_tokens": 320,
-        }
-
-        status, obj, raw = self._post(payload_openai)
-        if status == 200 and obj:
-            msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = parse_json_object(msg)
-            if parsed:
-                return {
-                    "ok": True,
-                    "status": status,
-                    "raw": msg,
-                    "json": parsed,
-                    "usage": obj.get("usage", {}),
-                }
-            # non-json soft fail
-            return {
-                "ok": False,
-                "status": status,
-                "raw": msg,
-                "error": "Model response is not valid JSON.",
-                "usage": obj.get("usage", {}),
+        errors: List[str] = []
+        for model_id in self.model_candidates:
+            payload_openai = {
+                "model": model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 320,
             }
 
-        # fallback shape for some gateways that proxy Anthropic-like format
-        payload_alt = {
-            "model": self.profile.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": b64,
+            status, obj, raw = self._post(payload_openai)
+            if status == 200 and obj:
+                msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+                parsed = parse_json_object(msg)
+                if parsed:
+                    return {
+                        "ok": True,
+                        "status": status,
+                        "raw": msg,
+                        "json": parsed,
+                        "usage": obj.get("usage", {}),
+                        "resolved_model": model_id,
+                    }
+                errors.append(f"{model_id}: non-json(openai-shape)")
+            else:
+                errors.append(f"{model_id}: openai-shape status={status} raw={raw[:120]}")
+
+            # fallback shape for some gateways that proxy Anthropic-like format
+            payload_alt = {
+                "model": model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": b64,
+                                },
                             },
-                        },
-                    ],
-                }
-            ],
-            "temperature": 0,
-            "max_tokens": 320,
-        }
-        status2, obj2, raw2 = self._post(payload_alt)
-        if status2 == 200 and obj2:
-            msg = obj2.get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = parse_json_object(msg)
-            if parsed:
-                return {
-                    "ok": True,
-                    "status": status2,
-                    "raw": msg,
-                    "json": parsed,
-                    "usage": obj2.get("usage", {}),
-                }
-            return {
-                "ok": False,
-                "status": status2,
-                "raw": msg,
-                "error": "Fallback response is not valid JSON.",
-                "usage": obj2.get("usage", {}),
+                        ],
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 320,
             }
+            status2, obj2, raw2 = self._post(payload_alt)
+            if status2 == 200 and obj2:
+                msg = obj2.get("choices", [{}])[0].get("message", {}).get("content", "")
+                parsed = parse_json_object(msg)
+                if parsed:
+                    return {
+                        "ok": True,
+                        "status": status2,
+                        "raw": msg,
+                        "json": parsed,
+                        "usage": obj2.get("usage", {}),
+                        "resolved_model": model_id,
+                    }
+                errors.append(f"{model_id}: non-json(alt-shape)")
+            else:
+                errors.append(f"{model_id}: alt-shape status={status2} raw={raw2[:120]}")
 
         return {
             "ok": False,
-            "status": status2 if status2 != -1 else status,
-            "raw": raw2 if raw2 else raw,
-            "error": "Image classification failed on both request formats.",
+            "status": -1,
+            "raw": "",
+            "error": "Image classification failed. " + " || ".join(errors[:4]),
         }
 
     def quick_test(self) -> Tuple[bool, str]:
@@ -374,25 +506,28 @@ class OpenAICompatibleClient:
             b"\x01\x00\x18\xdd\x8d\x18\x00\x00\x00\x00IEND\xaeB`\x82"
         )
         b64 = base64.b64encode(tiny).decode("ascii")
-        payload = {
-            "model": self.profile.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Reply exactly OK."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                }
-            ],
-            "temperature": 0,
-            "max_tokens": 8,
-        }
-        status, obj, raw = self._post(payload)
-        if status == 200 and obj:
-            msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return True, f"HTTP 200. Reply: {msg[:120]!r}"
-        return False, f"HTTP {status}. {raw[:220]}"
+        errs = []
+        for model_id in self.model_candidates:
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Reply exactly OK."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 8,
+            }
+            status, obj, raw = self._post(payload)
+            if status == 200 and obj:
+                msg = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return True, f"HTTP 200 via '{model_id}'. Reply: {msg[:120]!r}"
+            errs.append(f"{model_id}: {status} {raw[:80]}")
+        return False, " ; ".join(errs[:3])
 
 
 class OverlapEngine:
@@ -403,12 +538,14 @@ class OverlapEngine:
         logger,
         cancel_event: threading.Event,
         progress_cb,
+        render_dpi: int = 220,
     ) -> None:
         self.client = client
         self.memory = memory
         self.log = logger
         self.cancel_event = cancel_event
         self.progress_cb = progress_cb
+        self.render_dpi = max(120, min(360, int(render_dpi)))
 
     def memory_override(self, file_name: str, page_no: int) -> Optional[Dict[str, Any]]:
         key = f"{file_name.lower()}::{page_no}"
@@ -419,6 +556,8 @@ class OverlapEngine:
         pdf_paths: List[Path],
         scope: str,
         custom_prompt: str,
+        on_page_result: Optional[Callable[[Dict[str, Any], Path, fitz.Document], None]] = None,
+        on_file_done: Optional[Callable[[Path, fitz.Document, List[Dict[str, Any]]], None]] = None,
     ) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
         total_pages = 0
@@ -441,6 +580,7 @@ class OverlapEngine:
             except Exception as exc:
                 self.log(f"Failed to open {pdf_path}: {exc}")
                 continue
+            file_records: List[Dict[str, Any]] = []
 
             for idx in range(len(doc)):
                 if self.cancel_event.is_set():
@@ -450,27 +590,41 @@ class OverlapEngine:
                 file_name = pdf_path.name
                 override = self.memory_override(file_name, page_no)
                 if override:
+                    override_overlap = bool(override.get("is_overlap", False))
+                    override_blurry = bool(override.get("is_blurry", False))
+                    override_decision = "overlap" if override_overlap else ("blurry" if override_blurry else "clean")
                     rec = {
                         "source_directory": str(pdf_path.parent),
                         "file_name": file_name,
                         "file_path": str(pdf_path),
                         "page": page_no,
-                        "is_overlap": bool(override.get("is_overlap", False)),
+                        "decision": override_decision,
+                        "is_overlap": override_overlap,
+                        "is_blurry": override_blurry,
                         "confidence": float(override.get("confidence", 1.0)),
                         "overlap_type": str(override.get("overlap_type", "manual_override")),
                         "signatures": override.get("signatures", []),
                         "reason": str(override.get("note", "manual memory override")),
                         "scope": scope,
                         "model": self.client.profile.model,
+                        "resolved_model": "memory_override",
                         "status": "memory_override",
+                        "error_detail": "",
                     }
                     records.append(rec)
+                    file_records.append(rec)
+                    self.log("Page result (memory): " + summarize_page_result(rec))
+                    if on_page_result:
+                        try:
+                            on_page_result(rec, pdf_path, doc)
+                        except Exception as cb_exc:
+                            self.log(f"on_page_result callback failed: {cb_exc}")
                     done += 1
                     self.progress_cb(done, max(total_pages, 1))
                     continue
 
                 try:
-                    image_jpeg = render_page_jpeg(doc[idx])
+                    image_jpeg = render_page_jpeg(doc[idx], dpi=self.render_dpi)
                 except Exception as exc:
                     self.log(f"Render failed {pdf_path} p{page_no}: {exc}")
                     rec = {
@@ -478,16 +632,27 @@ class OverlapEngine:
                         "file_name": file_name,
                         "file_path": str(pdf_path),
                         "page": page_no,
+                        "decision": "uncertain",
                         "is_overlap": False,
+                        "is_blurry": False,
                         "confidence": 0.0,
                         "overlap_type": "none",
                         "signatures": [],
                         "reason": f"render_error: {exc}",
                         "scope": scope,
                         "model": self.client.profile.model,
+                        "resolved_model": "",
                         "status": "error",
+                        "error_detail": f"render_error: {exc}",
                     }
                     records.append(rec)
+                    file_records.append(rec)
+                    self.log("Page result (error): " + summarize_page_result(rec))
+                    if on_page_result:
+                        try:
+                            on_page_result(rec, pdf_path, doc)
+                        except Exception as cb_exc:
+                            self.log(f"on_page_result callback failed: {cb_exc}")
                     done += 1
                     self.progress_cb(done, max(total_pages, 1))
                     continue
@@ -501,48 +666,72 @@ class OverlapEngine:
                 )
 
                 if not result.get("ok"):
-                    self.log(
-                        f"LLM failed {file_name} p{page_no}: "
-                        f"status={result.get('status')} err={result.get('error')}"
-                    )
                     rec = {
                         "source_directory": str(pdf_path.parent),
                         "file_name": file_name,
                         "file_path": str(pdf_path),
                         "page": page_no,
+                        "decision": "uncertain",
                         "is_overlap": False,
+                        "is_blurry": False,
                         "confidence": 0.0,
                         "overlap_type": "none",
                         "signatures": [],
-                        "reason": f"llm_error: {result.get('error', 'unknown')}",
+                        "reason": "llm_error",
                         "scope": scope,
                         "model": self.client.profile.model,
+                        "resolved_model": result.get("resolved_model", ""),
                         "status": "llm_error",
+                        "error_detail": f"status={result.get('status')} err={result.get('error', 'unknown')} raw={str(result.get('raw', ''))[:240]}",
                     }
+                    self.log(
+                        f"LLM failed {file_name} p{page_no}: "
+                        f"{rec['error_detail']}"
+                    )
                 else:
                     obj = result.get("json", {})
                     sigs = obj.get("signatures", [])
                     if not isinstance(sigs, list):
                         sigs = []
                     sigs = [norm_sig(str(s)) for s in sigs if str(s).strip()][:2]
+                    decision, is_overlap, is_blurry = normalize_decision_fields(obj)
                     rec = {
                         "source_directory": str(pdf_path.parent),
                         "file_name": file_name,
                         "file_path": str(pdf_path),
                         "page": page_no,
-                        "is_overlap": bool(obj.get("is_overlap", False)),
+                        "decision": decision,
+                        "is_overlap": is_overlap,
+                        "is_blurry": is_blurry,
                         "confidence": float(obj.get("confidence", 0.0)),
                         "overlap_type": str(obj.get("overlap_type", "none")),
                         "signatures": sigs,
                         "reason": str(obj.get("reason", ""))[:500],
                         "scope": scope,
                         "model": self.client.profile.model,
+                        "resolved_model": result.get("resolved_model", ""),
                         "status": "ok",
+                        "error_detail": "",
                     }
+                    if decision == "uncertain":
+                        self.log("Page result (uncertain): " + summarize_page_result(rec))
+                    else:
+                        self.log("Page result: " + summarize_page_result(rec))
                 records.append(rec)
+                file_records.append(rec)
+                if on_page_result:
+                    try:
+                        on_page_result(rec, pdf_path, doc)
+                    except Exception as cb_exc:
+                        self.log(f"on_page_result callback failed: {cb_exc}")
                 done += 1
                 self.progress_cb(done, max(total_pages, 1))
 
+            if on_file_done:
+                try:
+                    on_file_done(pdf_path, doc, file_records)
+                except Exception as cb_exc:
+                    self.log(f"on_file_done callback failed: {cb_exc}")
             doc.close()
 
         return records
@@ -551,27 +740,66 @@ class OverlapEngine:
 def write_overlap_csv(records: List[Dict[str, Any]], out_csv: Path) -> int:
     overlaps = [r for r in records if r.get("is_overlap") and r.get("scope") == "source"]
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "source_directory",
-        "file_name",
-        "file_path",
-        "page",
-        "is_overlap",
-        "confidence",
-        "overlap_type",
-        "signatures",
-        "reason",
-        "model",
-        "status",
-    ]
     with out_csv.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields)
+        w = csv.DictWriter(fh, fieldnames=OVERLAP_CSV_FIELDS)
         w.writeheader()
         for r in overlaps:
-            row = dict(r)
-            row["signatures"] = " | ".join(r.get("signatures", []))
-            w.writerow({k: row.get(k, "") for k in fields})
+            w.writerow(overlap_row_for_csv(r))
     return len(overlaps)
+
+
+def export_single_tagged_page_from_doc(
+    doc: fitz.Document, src_path: Path, page: int, prefix: str, logger
+) -> bool:
+    out = src_path.parent / f"{prefix}_{src_path.stem}_P{page}.pdf"
+    try:
+        one = fitz.open()
+        one.insert_pdf(doc, from_page=page - 1, to_page=page - 1)
+        one.save(str(out))
+        one.close()
+        return True
+    except Exception as exc:
+        logger(f"Export {prefix}_ page failed {src_path.name} p{page}: {exc}")
+        return False
+
+
+def export_single_overlap_page_from_doc(
+    doc: fitz.Document, src_path: Path, page: int, logger
+) -> bool:
+    return export_single_tagged_page_from_doc(doc, src_path, page, "O", logger)
+
+
+def export_single_blurry_page_from_doc(
+    doc: fitz.Document, src_path: Path, page: int, logger
+) -> bool:
+    return export_single_tagged_page_from_doc(doc, src_path, page, "B", logger)
+
+
+def export_extracted_non_overlap_for_file(
+    doc: fitz.Document, src_path: Path, file_records: List[Dict[str, Any]], logger
+) -> bool:
+    marks: Dict[int, bool] = {}
+    for r in file_records:
+        if r.get("scope") != "source":
+            continue
+        marks[int(r["page"])] = bool(r.get("is_overlap"))
+
+    keep_pages = [p for p, is_ov in sorted(marks.items()) if not is_ov]
+    if not keep_pages:
+        logger(f"No non-overlap pages for {src_path.name}, skip E_ output.")
+        return False
+
+    out = src_path.parent / f"E_{src_path.name}"
+    try:
+        out_doc = fitz.open()
+        for p in keep_pages:
+            out_doc.insert_pdf(doc, from_page=p - 1, to_page=p - 1)
+        out_doc.save(str(out))
+        out_doc.close()
+        return True
+    except Exception as exc:
+        logger(f"Create E_ file failed {src_path.name}: {exc}")
+        return False
 
 
 def export_overlap_pages(records: List[Dict[str, Any]], logger) -> int:
@@ -598,6 +826,27 @@ def export_overlap_pages(records: List[Dict[str, Any]], logger) -> int:
                 created += 1
             except Exception as exc:
                 logger(f"Export overlap page failed {src.name} p{page}: {exc}")
+        doc.close()
+    return created
+
+
+def export_blurry_pages(records: List[Dict[str, Any]], logger) -> int:
+    targets = [r for r in records if r.get("scope") == "source" and r.get("is_blurry")]
+    by_file: Dict[str, List[int]] = {}
+    for r in targets:
+        by_file.setdefault(r["file_path"], []).append(int(r["page"]))
+
+    created = 0
+    for file_path, pages in by_file.items():
+        src = Path(file_path)
+        try:
+            doc = fitz.open(str(src))
+        except Exception as exc:
+            logger(f"Open failed {src}: {exc}")
+            continue
+        for page in sorted(set(pages)):
+            if export_single_blurry_page_from_doc(doc, src, page, logger):
+                created += 1
         doc.close()
     return created
 
@@ -647,7 +896,7 @@ def find_best_replacement(
     best: Optional[Dict[str, Any]] = None
     best_score = 0.0
     for c in candidate_recs:
-        if c.get("is_overlap"):
+        if c.get("is_overlap") or c.get("is_blurry"):
             continue
         if c.get("file_path") == overlap_rec.get("file_path") and int(c.get("page", 0)) == int(
             overlap_rec.get("page", 0)
@@ -683,7 +932,7 @@ def replace_overlap_pages(
     for r in source_records:
         source_by_file.setdefault(r["file_path"], []).append(r)
 
-    candidates = [r for r in all_records if not r.get("is_overlap")]
+    candidates = [r for r in all_records if not r.get("is_overlap") and not r.get("is_blurry")]
 
     report_rows: List[Dict[str, Any]] = []
     replaced_files = 0
@@ -783,9 +1032,11 @@ def import_training_csv(memory: Dict[str, Any], csv_path: Path) -> Tuple[int, in
 
             lbl_s = str(lbl_raw).strip().lower()
             is_overlap = lbl_s in {"1", "true", "yes", "y", "overlap", "ov"}
+            is_blurry = lbl_s in {"blurry", "blur", "unreadable"}
             key = f"{file_name.lower()}::{page}"
             overrides[key] = {
                 "is_overlap": is_overlap,
+                "is_blurry": is_blurry,
                 "confidence": 1.0,
                 "overlap_type": "manual_override",
                 "signatures": [],
@@ -842,7 +1093,7 @@ class App(tk.Tk):
         self.base_url_entry = ttk.Entry(top, textvariable=self.base_url_var, width=88)
         self.base_url_entry.grid(row=1, column=1, columnspan=5, sticky="we", padx=6, pady=(8, 0))
 
-        ttk.Label(top, text="Model ID").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="Model Name").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.model_id_var = tk.StringVar()
         self.model_id_entry = ttk.Entry(top, textvariable=self.model_id_var, width=35)
         self.model_id_entry.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
@@ -886,14 +1137,20 @@ class App(tk.Tk):
         self.act_identify_var = tk.BooleanVar(value=True)
         self.act_extract_var = tk.BooleanVar(value=True)
         self.act_replace_var = tk.BooleanVar(value=False)
+        self.act_blurry_var = tk.BooleanVar(value=False)
+        self.live_output_var = tk.BooleanVar(value=True)
+        self.fast_mode_var = tk.BooleanVar(value=False)
 
         row3 = ttk.Frame(scan_frame)
         row3.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(row3, text="Recursive scan", variable=self.recursive_var).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(row3, text="Live output while scanning", variable=self.live_output_var).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(row3, text="Fast mode (lower DPI)", variable=self.fast_mode_var).pack(side=tk.LEFT, padx=8)
         ttk.Checkbutton(row3, text="1) Generate overlap CSV", variable=self.act_csv_var).pack(side=tk.LEFT, padx=8)
         ttk.Checkbutton(row3, text="2) Export O_*.pdf pages", variable=self.act_identify_var).pack(side=tk.LEFT, padx=8)
         ttk.Checkbutton(row3, text="3) Export E_*.pdf (remove overlaps)", variable=self.act_extract_var).pack(side=tk.LEFT, padx=8)
         ttk.Checkbutton(row3, text="4) Replace overlaps -> R_*.pdf", variable=self.act_replace_var).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(row3, text="5) Export B_*.pdf blurry pages", variable=self.act_blurry_var).pack(side=tk.LEFT, padx=8)
 
         scan_frame.columnconfigure(1, weight=1)
 
@@ -984,7 +1241,11 @@ class App(tk.Tk):
         base_url = simpledialog.askstring("Add Model", "Base URL:", parent=self)
         if not base_url:
             return
-        model = simpledialog.askstring("Add Model", "Model ID:", parent=self)
+        model = simpledialog.askstring(
+            "Add Model",
+            "Model Name / Alias (for built-ins use names like GPT-5.3, Kimi-K2.5):",
+            parent=self,
+        )
         if not model:
             return
         api_key = simpledialog.askstring("Add Model", "API Key (optional):", parent=self, show="*") or ""
@@ -1171,6 +1432,9 @@ class App(tk.Tk):
 
         custom_prompt = self.prompt_text.get("1.0", tk.END).strip()
         recursive = bool(self.recursive_var.get())
+        live_output = bool(self.live_output_var.get())
+        fast_mode = bool(self.fast_mode_var.get())
+        render_dpi = 170 if fast_mode else 220
 
         self.cancel_event.clear()
         self.progress["value"] = 0
@@ -1183,8 +1447,16 @@ class App(tk.Tk):
             self.after(0, _set)
 
         def worker() -> None:
+            live_csv_fh = None
             try:
                 self.log("Starting pipeline...")
+                self.log(
+                    "Identify overlap/blurry settings: "
+                    f"live_output={live_output}, render_dpi={render_dpi}, "
+                    f"overlap_csv={self.act_csv_var.get()}, export_O={self.act_identify_var.get()}, "
+                    f"export_E={self.act_extract_var.get()}, replace_R={self.act_replace_var.get()}, "
+                    f"export_B={self.act_blurry_var.get()}"
+                )
                 src_pdfs = list_pdfs(source_dir, recursive=recursive)
                 if not src_pdfs:
                     self.log("No PDF files found in source directory.")
@@ -1207,9 +1479,52 @@ class App(tk.Tk):
                     logger=self.log,
                     cancel_event=self.cancel_event,
                     progress_cb=progress_cb,
+                    render_dpi=render_dpi,
                 )
 
-                source_records = engine.scan_pdfs(src_pdfs, scope="source", custom_prompt=custom_prompt)
+                live_csv_writer: Optional[csv.DictWriter] = None
+                live_o_count = 0
+                live_e_count = 0
+                live_b_count = 0
+                if live_output and self.act_csv_var.get():
+                    csv_path.parent.mkdir(parents=True, exist_ok=True)
+                    live_csv_fh = csv_path.open("w", newline="", encoding="utf-8")
+                    live_csv_writer = csv.DictWriter(live_csv_fh, fieldnames=OVERLAP_CSV_FIELDS)
+                    live_csv_writer.writeheader()
+                    live_csv_fh.flush()
+                    self.log(f"Live CSV started: {csv_path}")
+
+                def on_source_page_result(rec: Dict[str, Any], pdf_path: Path, doc: fitz.Document) -> None:
+                    nonlocal live_o_count, live_b_count
+                    if rec.get("scope") != "source":
+                        return
+                    if live_output and self.act_csv_var.get() and live_csv_writer and live_csv_fh and rec.get("is_overlap"):
+                        live_csv_writer.writerow(overlap_row_for_csv(rec))
+                        live_csv_fh.flush()
+
+                    if live_output and self.act_identify_var.get() and rec.get("is_overlap"):
+                        if export_single_overlap_page_from_doc(doc, pdf_path, int(rec["page"]), self.log):
+                            live_o_count += 1
+
+                    if live_output and self.act_blurry_var.get() and rec.get("is_blurry"):
+                        if export_single_blurry_page_from_doc(doc, pdf_path, int(rec["page"]), self.log):
+                            live_b_count += 1
+
+                def on_source_file_done(pdf_path: Path, doc: fitz.Document, file_records: List[Dict[str, Any]]) -> None:
+                    nonlocal live_e_count
+                    if self.cancel_event.is_set():
+                        return
+                    if live_output and self.act_extract_var.get():
+                        if export_extracted_non_overlap_for_file(doc, pdf_path, file_records, self.log):
+                            live_e_count += 1
+
+                source_records = engine.scan_pdfs(
+                    src_pdfs,
+                    scope="source",
+                    custom_prompt=custom_prompt,
+                    on_page_result=on_source_page_result if live_output else None,
+                    on_file_done=on_source_file_done if live_output else None,
+                )
                 all_records = list(source_records)
 
                 if extra_pdfs and not self.cancel_event.is_set():
@@ -1225,26 +1540,48 @@ class App(tk.Tk):
                     return
 
                 if self.act_csv_var.get():
-                    count = write_overlap_csv(source_records, csv_path)
-                    self.log(f"Action 1 done: CSV saved to {csv_path} (overlaps={count})")
+                    if live_output:
+                        count = len([r for r in source_records if r.get("is_overlap")])
+                        self.log(f"Action 1 done (live): CSV saved to {csv_path} (overlaps={count})")
+                    else:
+                        count = write_overlap_csv(source_records, csv_path)
+                        self.log(f"Action 1 done: CSV saved to {csv_path} (overlaps={count})")
 
                 if self.act_identify_var.get():
-                    cnt = export_overlap_pages(source_records, self.log)
-                    self.log(f"Action 2 done: exported O_ pages = {cnt}")
+                    if live_output:
+                        self.log(f"Action 2 done (live): exported O_ pages = {live_o_count}")
+                    else:
+                        cnt = export_overlap_pages(source_records, self.log)
+                        self.log(f"Action 2 done: exported O_ pages = {cnt}")
 
                 if self.act_extract_var.get():
-                    cnt = export_extracted_non_overlap(source_records, self.log)
-                    self.log(f"Action 3 done: created E_ files = {cnt}")
+                    if live_output:
+                        self.log(f"Action 3 done (live): created E_ files = {live_e_count}")
+                    else:
+                        cnt = export_extracted_non_overlap(source_records, self.log)
+                        self.log(f"Action 3 done: created E_ files = {cnt}")
 
                 if self.act_replace_var.get():
                     cnt, rep_csv = replace_overlap_pages(source_records, all_records, self.log)
                     self.log(f"Action 4 done: created R_ files = {cnt}")
                     self.log(f"Replacement report: {rep_csv}")
 
+                if self.act_blurry_var.get():
+                    if live_output:
+                        self.log(f"Action 5 done (live): exported B_ pages = {live_b_count}")
+                    else:
+                        cnt = export_blurry_pages(source_records, self.log)
+                        self.log(f"Action 5 done: exported B_ pages = {cnt}")
+
                 self.log("Pipeline finished.")
             except Exception:
                 self.log("Pipeline crashed:\n" + traceback.format_exc())
             finally:
+                if live_csv_fh:
+                    try:
+                        live_csv_fh.close()
+                    except Exception:
+                        pass
                 self.after(0, lambda: self.progress.configure(value=0))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
