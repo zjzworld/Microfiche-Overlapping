@@ -11,16 +11,28 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt pyinstaller
-      - run: pyinstaller --noconfirm --clean --onefile --windowed --name MicroficheOverlapExtractor microfiche_overlap_extractor.py
-      - uses: actions/upload-artifact@v4
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name MicroficheOverlapExtractor --collect-all paddleocr --collect-all paddlex --collect-all paddle microfiche_overlap_extractor.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: MicroficheOverlapExtractor-windows
           path: dist/MicroficheOverlapExtractor.exe
+          if-no-files-found: error
